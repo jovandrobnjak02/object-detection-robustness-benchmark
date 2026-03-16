@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 import torch.optim as optim
 
-from datasets.custom_cnn_dataset import get_dataloader
+from datasets.kitti_dataset import get_dataloader
 from models.custom_cnn import CustomCNN, CustomCNNLoss
 
 EPOCHS      = 135
