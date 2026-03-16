@@ -1,11 +1,5 @@
 #!/bin/bash
 #
-# split_dataset.sh
-#
-# Randomly splits the KITTI 2D object detection dataset into train and val sets.
-# Expects matched image (.png) and label (.txt) files in data/kitti/images/ and
-# data/kitti/labels/, then copies them into data/kitti/train/ and data/kitti/val/.
-#
 # Split: 3712 train / 3769 val (7481 total)
 #
 # Original images downloaded from:
@@ -30,7 +24,6 @@ VAL_COUNT=3769
 
 mkdir -p "$TRAIN_IMAGES" "$TRAIN_LABELS" "$VAL_IMAGES" "$VAL_LABELS"
 
-# Get randomly shuffled list of image basenames that have matching labels
 mapfile -t FILES < <(
     for img in "$IMAGES_DIR"/*.png; do
         base=$(basename "$img" .png)
@@ -47,7 +40,7 @@ if (( TOTAL != TRAIN_COUNT + VAL_COUNT )); then
     echo "Warning: expected $((TRAIN_COUNT + VAL_COUNT)) pairs, got $TOTAL"
 fi
 
-# Copy train split
+
 echo "Copying $TRAIN_COUNT train samples..."
 for i in "${!FILES[@]}"; do
     if (( i < TRAIN_COUNT )); then
@@ -57,7 +50,6 @@ for i in "${!FILES[@]}"; do
     fi
 done
 
-# Copy val split
 echo "Copying $VAL_COUNT val samples..."
 for i in "${!FILES[@]}"; do
     if (( i >= TRAIN_COUNT )); then

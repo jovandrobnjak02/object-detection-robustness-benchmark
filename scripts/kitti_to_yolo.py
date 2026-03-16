@@ -1,21 +1,4 @@
 """
-kitti_to_yolo.py
-
-Converts KITTI 2D object detection labels to YOLO format in-place.
-Processes data/kitti/train/labels/ and data/kitti/val/labels/.
-
-KITTI label format (15 fields per line):
-  type truncated occluded alpha left top right bottom h w l x y z rotation_y
-
-YOLO format (normalized):
-  class_id center_x center_y width height
-
-Class mapping:
-  Car, Van     -> 0
-  Pedestrian   -> 1
-  Cyclist      -> 2
-  (all other types are ignored)
-
 Requires:
   scripts/split_dataset.sh must be run first on raw KITTI data.
 
@@ -28,9 +11,8 @@ from pathlib import Path
 
 
 def png_size(path: Path) -> tuple[int, int]:
-    """Read width and height from PNG file header without loading the image."""
     with open(path, "rb") as f:
-        f.read(16)  # 8-byte signature + 4-byte length + 4-byte chunk type
+        f.read(16)
         w = struct.unpack(">I", f.read(4))[0]
         h = struct.unpack(">I", f.read(4))[0]
     return w, h
