@@ -5,20 +5,21 @@ from pathlib import Path
 
 import torch
 import torch.optim as optim
+from torch.amp import GradScaler, autocast
 
 from datasets.kitti_dataset import get_dataloader
 from models.custom_cnn import CustomCNN, CustomCNNLoss
 
 EPOCHS      = 135
-BATCH_SIZE  = 4
+BATCH_SIZE  = 16
 NUM_WORKERS = 4
 IMG_SIZE    = 448
-LR          = 1e-3
+LR          = 1e-4
 CHECKPOINTS = Path(__file__).parent.parent / "checkpoints"
 LOGS        = Path(__file__).parent.parent / "results" / "logs"
 
 
-def run_epoch(model, loader, criterion, optimizer, device):
+def run_epoch(model, loader, criterion, optimizer, scaler, device):
     model.train()
     total_loss = 0.0
 
@@ -26,11 +27,16 @@ def run_epoch(model, loader, criterion, optimizer, device):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        preds = model(images)
-        loss  = criterion(preds, labels)
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        with autocast("cuda"):
+            preds = model(images)
+            loss  = criterion(preds.float(), labels)
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
 
@@ -44,12 +50,14 @@ def run_val(model, loader, criterion, device):
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        preds  = model(images)
-        total_loss += criterion(preds, labels).item()
+        with autocast("cuda"):
+            preds = model(images)
+            total_loss += criterion(preds.float(), labels).item()
     return total_loss / len(loader)
 
 
 def train(use_batchnorm: bool, use_residual: bool):
+    torch.set_float32_matmul_precision("high")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -69,9 +77,11 @@ def train(use_batchnorm: bool, use_residual: bool):
     train_loader = get_dataloader("train", img_size=IMG_SIZE, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
     val_loader   = get_dataloader("val",   img_size=IMG_SIZE, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False)
 
-    model     = CustomCNN(use_batchnorm=use_batchnorm, use_residual=use_residual).to(device)
+    raw_model = CustomCNN(use_batchnorm=use_batchnorm, use_residual=use_residual).to(device)
     criterion = CustomCNNLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=5e-4)
+    optimizer = optim.AdamW(raw_model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+    scaler    = GradScaler("cuda")
 
     start_epoch = 1
     best_val    = float("inf")
@@ -79,19 +89,31 @@ def train(use_batchnorm: bool, use_residual: bool):
 
     try:
         ckpt = torch.load(resume_path, map_location=device)
-        model.load_state_dict(ckpt["model_state"])
+        raw_model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
+        if "scheduler_state" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+        if "scaler_state" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state"])
         start_epoch = ckpt["epoch"] + 1
         best_val    = ckpt["val_loss"]
         print(f"Resumed from epoch {ckpt['epoch']}, val_loss {ckpt['val_loss']:.4f}")
     except FileNotFoundError:
+        pass
+
+    # Defensive: ensure CSV has a header
+    if not log_path.exists() or log_path.stat().st_size == 0:
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "lr", "epoch_time_s"])
 
+    # Compile after loading state — save/load uses raw_model to avoid _orig_mod. key prefix
+    model = torch.compile(raw_model)
+
     for epoch in range(start_epoch, EPOCHS + 1):
         t0 = time.time()
-        train_loss = run_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = run_epoch(model, train_loader, criterion, optimizer, scaler, device)
         val_loss   = run_val(model, val_loader, criterion, device)
+        scheduler.step()
         elapsed    = time.time() - t0
 
         current_lr = optimizer.param_groups[0]["lr"]
@@ -106,8 +128,10 @@ def train(use_batchnorm: bool, use_residual: bool):
 
         ckpt = {
             "epoch": epoch,
-            "model_state": model.state_dict(),
+            "model_state": raw_model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state": scaler.state_dict(),
             "val_loss": val_loss,
             "use_batchnorm": use_batchnorm,
             "use_residual": use_residual,

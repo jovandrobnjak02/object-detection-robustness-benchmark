@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Split: 3712 train / 3769 val (7481 total)
+# Split: 5985 train / 1496 val (7481 total)
 #
 # Original images downloaded from:
 # https://www.cvlibs.net/datasets/kitti/eval_object.php?obj_benchmark=2d
@@ -19,8 +19,8 @@ TRAIN_LABELS="$DATA_DIR/train/labels"
 VAL_IMAGES="$DATA_DIR/val/images"
 VAL_LABELS="$DATA_DIR/val/labels"
 
-TRAIN_COUNT=3712
-VAL_COUNT=3769
+TRAIN_COUNT=5985
+VAL_COUNT=1496
 
 mkdir -p "$TRAIN_IMAGES" "$TRAIN_LABELS" "$VAL_IMAGES" "$VAL_LABELS"
 

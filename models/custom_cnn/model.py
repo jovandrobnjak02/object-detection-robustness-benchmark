@@ -91,13 +91,30 @@ class CustomCNN(nn.Module):
             _conv(1024, 1024, 3, use_batchnorm=bn),
         )
 
+        # Head — 1×1 conv reduces channels before flattening to preserve spatial info
         self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(1024 * S * S, 4096),
+            _conv(1024, 256, 1, use_batchnorm=bn),  # 1024 → 256 channels
+            nn.Flatten(),                             # 256 * 7 * 7 = 12544
+            nn.Linear(256 * S * S, 4096),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Dropout(0.5),
+            nn.Dropout(0.1 if use_batchnorm else 0.5),
             nn.Linear(4096, S * S * (B * 5 + C)),
         )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, a=0.1, mode="fan_out", nonlinearity="leaky_relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
@@ -105,4 +122,15 @@ class CustomCNN(nn.Module):
         x = self.block5(x)
         x = self.block6(x)
         x = self.head(x)
-        return x.view(-1, self.S, self.S, self.B * 5 + self.C)
+        out = x.view(-1, self.S, self.S, self.B * 5 + self.C)
+
+        # Apply sigmoid to cx, cy, conf, class — leave w, h raw
+        # Indices to sigmoid: [0,1,4, 5,6,9, 10,11,12] for B=2, C=3
+        sig_idx = []
+        for i in range(self.B):
+            base = i * 5
+            sig_idx.extend([base, base + 1, base + 4])  # cx, cy, conf
+        sig_idx.extend(range(self.B * 5, self.B * 5 + self.C))  # classes
+        out[..., sig_idx] = torch.sigmoid(out[..., sig_idx])
+
+        return out
