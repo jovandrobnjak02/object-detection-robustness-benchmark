@@ -4,8 +4,7 @@ from pathlib import Path
 from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).parent.parent
-DATA_YAML    = PROJECT_ROOT / "data" / "kitti" / "kitti.yaml"
-RESULTS_DIR  = PROJECT_ROOT / "results"
+DATA_YAML    = PROJECT_ROOT / "data" / "bdd100k.yaml"
 
 
 def train(model_name: str, epochs: int, batch: int, imgsz: int):
@@ -29,8 +28,8 @@ def train(model_name: str, epochs: int, batch: int, imgsz: int):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train YOLO26 on KITTI")
-    parser.add_argument("--model", type=str, default="yolo26s", help="Model variant (yolo26n/s/m/l/x)")
+    parser = argparse.ArgumentParser(description="Train YOLO26 on BDD100K clear/day")
+    parser.add_argument("--model", type=str, default="yolo26n", help="Model variant (yolo26n/s/m/l/x)")
     parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
     parser.add_argument("--batch", type=int, default=16, help="Batch size")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size")

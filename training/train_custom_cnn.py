@@ -1,22 +1,27 @@
-import argparse
 import csv
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
 
-from datasets.kitti_dataset import get_dataloader
+from datasets.bdd100k_dataset import get_dataloader
 from models.custom_cnn import CustomCNN, CustomCNNLoss
 
-EPOCHS      = 135
-BATCH_SIZE  = 16
-NUM_WORKERS = 4
-IMG_SIZE    = 448
-LR          = 1e-4
-CHECKPOINTS = Path(__file__).parent.parent / "checkpoints"
-LOGS        = Path(__file__).parent.parent / "results" / "logs"
+EPOCHS         = 200
+WARMUP_EPOCHS  = 5
+BATCH_SIZE     = 128
+NUM_WORKERS    = 8
+IMG_SIZE       = 448
+LR             = 1e-4
+NUM_CLASSES    = 10
+
+CHECKPOINTS    = Path(__file__).parent.parent / "checkpoints" / "custom_cnn"
+LOGS           = Path(__file__).parent.parent / "results" / "logs"
 
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device):
@@ -56,31 +61,29 @@ def run_val(model, loader, criterion, device):
     return total_loss / len(loader)
 
 
-def train(use_batchnorm: bool, use_residual: bool):
+def train():
     torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    tag = "baseline"
-    if use_batchnorm and use_residual:
-        tag = "full"
-    elif use_batchnorm:
-        tag = "mod_a_batchnorm"
-    elif use_residual:
-        tag = "mod_b_residual"
-    print(f"Run: {tag}")
+    tag = "bdd100k_custom_cnn"
+    print(f"Run: {tag} (full variant, C={NUM_CLASSES})")
 
     CHECKPOINTS.mkdir(parents=True, exist_ok=True)
     LOGS.mkdir(parents=True, exist_ok=True)
     log_path = LOGS / f"{tag}.csv"
 
-    train_loader = get_dataloader("train", img_size=IMG_SIZE, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
-    val_loader   = get_dataloader("val",   img_size=IMG_SIZE, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False)
+    train_loader = get_dataloader("clear_day/train", img_size=IMG_SIZE, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
+    val_loader   = get_dataloader("clear_day/val",   img_size=IMG_SIZE, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False)
 
-    raw_model = CustomCNN(use_batchnorm=use_batchnorm, use_residual=use_residual).to(device)
-    criterion = CustomCNNLoss()
+    # Full variant: BN + residual, 10 classes
+    raw_model = CustomCNN(C=NUM_CLASSES, use_batchnorm=True, use_residual=True).to(device)
+    criterion = CustomCNNLoss(C=NUM_CLASSES)
     optimizer = optim.AdamW(raw_model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+    warmup_sched = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=WARMUP_EPOCHS)
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - WARMUP_EPOCHS, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[WARMUP_EPOCHS])
     scaler    = GradScaler("cuda")
 
     start_epoch = 1
@@ -88,7 +91,7 @@ def train(use_batchnorm: bool, use_residual: bool):
     resume_path = CHECKPOINTS / f"{tag}_latest.pt"
 
     try:
-        ckpt = torch.load(resume_path, map_location=device)
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         if "scheduler_state" in ckpt:
@@ -100,31 +103,35 @@ def train(use_batchnorm: bool, use_residual: bool):
         print(f"Resumed from epoch {ckpt['epoch']}, val_loss {ckpt['val_loss']:.4f}")
     except FileNotFoundError:
         pass
+    except (RuntimeError, KeyError) as e:
+        print(f"Cannot resume (architecture changed): {e}")
+        print("Starting fresh.")
 
-    # Defensive: ensure CSV has a header
     if not log_path.exists() or log_path.stat().st_size == 0:
         with open(log_path, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "lr", "epoch_time_s"])
+            csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "lr", "epoch_time_s", "gpu_peak_mem_mb"])
 
-    # Compile after loading state — save/load uses raw_model to avoid _orig_mod. key prefix
     model = torch.compile(raw_model)
 
     for epoch in range(start_epoch, EPOCHS + 1):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
         t0 = time.time()
         train_loss = run_epoch(model, train_loader, criterion, optimizer, scaler, device)
         val_loss   = run_val(model, val_loader, criterion, device)
         scheduler.step()
         elapsed    = time.time() - t0
+        gpu_mem_mb = torch.cuda.max_memory_allocated(device) / 1024**2 if torch.cuda.is_available() else 0.0
 
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch:3d}/{EPOCHS} | "
             f"train {train_loss:.4f} | val {val_loss:.4f} | "
-            f"lr {current_lr:.2e} | {elapsed:.0f}s"
+            f"lr {current_lr:.2e} | {elapsed:.0f}s | GPU {gpu_mem_mb:.0f}MB"
         )
 
         with open(log_path, "a", newline="") as f:
-            csv.writer(f).writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{current_lr:.2e}", f"{elapsed:.1f}"])
+            csv.writer(f).writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{current_lr:.2e}", f"{elapsed:.1f}", f"{gpu_mem_mb:.0f}"])
 
         ckpt = {
             "epoch": epoch,
@@ -133,8 +140,6 @@ def train(use_batchnorm: bool, use_residual: bool):
             "scheduler_state": scheduler.state_dict(),
             "scaler_state": scaler.state_dict(),
             "val_loss": val_loss,
-            "use_batchnorm": use_batchnorm,
-            "use_residual": use_residual,
         }
         torch.save(ckpt, CHECKPOINTS / f"{tag}_latest.pt")
 
@@ -148,9 +153,4 @@ def train(use_batchnorm: bool, use_residual: bool):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train CustomCNN on KITTI")
-    parser.add_argument("--batchnorm", action="store_true", help="Enable batch normalization (mod A)")
-    parser.add_argument("--residual",  action="store_true", help="Enable residual connections (mod B)")
-    args = parser.parse_args()
-
-    train(use_batchnorm=args.batchnorm, use_residual=args.residual)
+    train()

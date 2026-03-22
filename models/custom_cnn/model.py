@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 
 
-S = 7   # grid size
+S = 14  # grid size
 B = 2   # boxes per cell
-C = 3   # classes: Car/Van, Pedestrian, Cyclist
+C = 10  # number of classes
 
 
 def _conv(in_ch, out_ch, k, s=1, p=None, use_batchnorm=False):
@@ -51,54 +51,40 @@ class CustomCNN(nn.Module):
 
         self.stem = nn.Sequential(
             # Block 1
-            _conv(3, 64, 7, s=2, use_batchnorm=bn),    # 448 → 224
-            nn.MaxPool2d(2, 2),                          # 224 → 112
+            _conv(3, 32, 7, s=2, use_batchnorm=bn),     # 448 to 224
+            nn.MaxPool2d(2, 2),                           # 224 to 112
 
             # Block 2
-            _conv(64, 192, 3, use_batchnorm=bn),
-            nn.MaxPool2d(2, 2),                          # 112 → 56
+            _conv(32, 96, 3, use_batchnorm=bn),
+            nn.MaxPool2d(2, 2),                           # 112 to 56
 
             # Block 3
-            _conv(192, 128, 1, use_batchnorm=bn),
+            _conv(96, 128, 1, use_batchnorm=bn),
             _conv(128, 256, 3, use_batchnorm=bn),
-            _conv(256, 256, 1, use_batchnorm=bn),
-            _conv(256, 512, 3, use_batchnorm=bn),
-            nn.MaxPool2d(2, 2),                          # 56 → 28
+            nn.MaxPool2d(2, 2),                           # 56 to 28
         )
 
-        # Block 4 — 4× bottleneck (residual applied per pair, ch_in=512)
+        # Block 4 — 2× bottleneck + maxpool
         self.block4 = nn.Sequential(
-            _BottleneckBlock(512, 256, bn, res),
-            _BottleneckBlock(512, 256, bn, res),
-            _BottleneckBlock(512, 256, bn, res),
-            _BottleneckBlock(512, 256, bn, res),
-            _conv(512, 512,  1, use_batchnorm=bn),
-            _conv(512, 1024, 3, use_batchnorm=bn),
-            nn.MaxPool2d(2, 2),                          # 28 → 14
+            _BottleneckBlock(256, 128, bn, res),
+            _BottleneckBlock(256, 128, bn, res),
+            _conv(256, 256, 3, use_batchnorm=bn),
+            nn.MaxPool2d(2, 2),                           # 28 to 14
         )
 
-        # Block 5 — 2× bottleneck (residual applied per pair, ch_in=1024)
+        # Block 5 — 2× bottleneck + convs
         self.block5 = nn.Sequential(
-            _BottleneckBlock(1024, 512, bn, res),
-            _BottleneckBlock(1024, 512, bn, res),
-            _conv(1024, 1024, 3, use_batchnorm=bn),
-            _conv(1024, 1024, 3, s=2, use_batchnorm=bn),  # 14 → 7
+            _BottleneckBlock(256, 128, bn, res),
+            _BottleneckBlock(256, 128, bn, res),
+            _conv(256, 256, 3, use_batchnorm=bn),
+            _conv(256, 256, 3, use_batchnorm=bn),          # 14 to 14
         )
 
-        # Block 6
-        self.block6 = nn.Sequential(
-            _conv(1024, 1024, 3, use_batchnorm=bn),
-            _conv(1024, 1024, 3, use_batchnorm=bn),
-        )
-
-        # Head — 1×1 conv reduces channels before flattening to preserve spatial info
+        # Head — fully convolutional (no FC layers)
+        out_ch = B * 5 + C
         self.head = nn.Sequential(
-            _conv(1024, 256, 1, use_batchnorm=bn),  # 1024 → 256 channels
-            nn.Flatten(),                             # 256 * 7 * 7 = 12544
-            nn.Linear(256 * S * S, 4096),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Dropout(0.1 if use_batchnorm else 0.5),
-            nn.Linear(4096, S * S * (B * 5 + C)),
+            _conv(256, 128, 1, use_batchnorm=bn),
+            nn.Conv2d(128, out_ch, 1),  # raw output, no activation
         )
 
         self._init_weights()
@@ -112,25 +98,19 @@ class CustomCNN(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, mean=0.0, std=0.01)
-                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
         x = self.block4(x)
         x = self.block5(x)
-        x = self.block6(x)
-        x = self.head(x)
-        out = x.view(-1, self.S, self.S, self.B * 5 + self.C)
+        x = self.head(x)                          # (batch, B*5+C, S, S)
+        out = x.permute(0, 2, 3, 1).contiguous()  # (batch, S, S, B*5+C)
 
-        # Apply sigmoid to cx, cy, conf, class — leave w, h raw
-        # Indices to sigmoid: [0,1,4, 5,6,9, 10,11,12] for B=2, C=3
+        # Apply sigmoid to cx, cy, conf — leave w, h raw, classes as logits (BCE with logits in loss)
         sig_idx = []
         for i in range(self.B):
             base = i * 5
             sig_idx.extend([base, base + 1, base + 4])  # cx, cy, conf
-        sig_idx.extend(range(self.B * 5, self.B * 5 + self.C))  # classes
         out[..., sig_idx] = torch.sigmoid(out[..., sig_idx])
 
         return out

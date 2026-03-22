@@ -1,0 +1,16 @@
+# BDD100K clear/daytime split for YOLO26 training
+path: ../data
+train: clear_day/train/images
+val: clear_day/val/images
+
+names:
+  0: car
+  1: person
+  2: traffic sign
+  3: traffic light
+  4: truck
+  5: bus
+  6: bike
+  7: rider
+  8: motor
+  9: train

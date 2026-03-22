@@ -1,11 +1,19 @@
 # ── Datasets (too large for git) ──────────────────────────
-data/
 *.bin
 *.png
 *.jpg
 *.jpeg
 *.pcd
 *.velodyne
+*.txt
+*.cache
+.cache_*/
+*.npy
+data/clear_day/
+data/night/
+data/overcast/
+data/rainy/
+data/snowy/
 
 # ── Model checkpoints & weights ───────────────────────────
 checkpoints/

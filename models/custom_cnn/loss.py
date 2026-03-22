@@ -1,5 +1,8 @@
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def iou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
@@ -27,24 +30,58 @@ def iou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
     return inter / (union + 1e-6)
 
 
+def ciou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
+    eps = 1e-7
+    # Convert to corners
+    px1 = box_pred[..., 0] - box_pred[..., 2] / 2
+    py1 = box_pred[..., 1] - box_pred[..., 3] / 2
+    px2 = box_pred[..., 0] + box_pred[..., 2] / 2
+    py2 = box_pred[..., 1] + box_pred[..., 3] / 2
+
+    gx1 = box_gt[..., 0] - box_gt[..., 2] / 2
+    gy1 = box_gt[..., 1] - box_gt[..., 3] / 2
+    gx2 = box_gt[..., 0] + box_gt[..., 2] / 2
+    gy2 = box_gt[..., 1] + box_gt[..., 3] / 2
+
+    # IoU
+    inter_x1 = torch.max(px1, gx1)
+    inter_y1 = torch.max(py1, gy1)
+    inter_x2 = torch.min(px2, gx2)
+    inter_y2 = torch.min(py2, gy2)
+    inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
+    area_p = (px2 - px1).clamp(0) * (py2 - py1).clamp(0)
+    area_g = (gx2 - gx1).clamp(0) * (gy2 - gy1).clamp(0)
+    union = area_p + area_g - inter
+    iou_val = inter / (union + eps)
+
+    # Center distance penalty
+    rho2 = (box_pred[..., 0] - box_gt[..., 0]) ** 2 + \
+           (box_pred[..., 1] - box_gt[..., 1]) ** 2
+    # Diagonal of smallest enclosing box
+    enc_x1 = torch.min(px1, gx1)
+    enc_y1 = torch.min(py1, gy1)
+    enc_x2 = torch.max(px2, gx2)
+    enc_y2 = torch.max(py2, gy2)
+    c2 = (enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2 + eps
+
+    # Aspect ratio penalty
+    v = (4 / (math.pi ** 2)) * (
+        torch.atan(box_gt[..., 2] / (box_gt[..., 3] + eps))
+        - torch.atan(box_pred[..., 2] / (box_pred[..., 3] + eps))
+    ) ** 2
+    with torch.no_grad():
+        alpha = v / (1 - iou_val + v + eps)
+
+    return 1 - iou_val + rho2 / c2 + alpha * v
+
+
 def decode_predictions(
     predictions: torch.Tensor,
-    S: int = 7,
+    S: int = 14,
     B: int = 2,
-    C: int = 3,
+    C: int = 10,
     conf_thresh: float = 0.25,
 ) -> list[torch.Tensor]:
-    """
-    Decode raw model output into a list of detections per image.
-
-    Args:
-        predictions: (batch, S, S, B*5 + C) — sigmoid already applied to cx, cy, conf, class
-        conf_thresh: minimum confidence to keep a detection
-
-    Returns:
-        List of (N, 7) tensors per image: [cx, cy, w, h, conf, class_conf, class_id]
-        All coordinates are in image-normalised space [0, 1].
-    """
     batch_size = predictions.shape[0]
     cell_size = 1.0 / S
     results = []
@@ -55,7 +92,7 @@ def decode_predictions(
 
         for row in range(S):
             for col in range(S):
-                class_scores = pred[row, col, B * 5:]       # (C,)
+                class_scores = pred[row, col, B * 5:].sigmoid()  # logits → probs
                 best_cls_conf, best_cls = class_scores.max(0)
 
                 for j in range(B):
@@ -83,21 +120,10 @@ def decode_predictions(
 
 
 def nms(detections: torch.Tensor, iou_thresh: float = 0.5) -> torch.Tensor:
-    """
-    Non-Maximum Suppression.
-
-    Args:
-        detections: (N, 7) — [cx, cy, w, h, conf, class_conf, class_id]
-        iou_thresh: IoU threshold for suppression
-
-    Returns:
-        Filtered (M, 7) tensor.
-    """
     if detections.shape[0] == 0:
         return detections
 
     keep = []
-    # Sort by confidence descending
     order = detections[:, 4].argsort(descending=True)
     detections = detections[order]
 
@@ -110,7 +136,6 @@ def nms(detections: torch.Tensor, iou_thresh: float = 0.5) -> torch.Tensor:
             detections[0, :4].unsqueeze(0).expand(detections.shape[0] - 1, -1),
             detections[1:, :4],
         )
-        # Keep boxes with low overlap OR different class
         same_class = detections[1:, 6] == detections[0, 6]
         suppress = (ious > iou_thresh) & same_class
         detections = detections[1:][~suppress]
@@ -121,11 +146,11 @@ def nms(detections: torch.Tensor, iou_thresh: float = 0.5) -> torch.Tensor:
 class CustomCNNLoss(nn.Module):
     def __init__(
         self,
-        S: int = 7,
+        S: int = 14,
         B: int = 2,
-        C: int = 3,
+        C: int = 10,
         lambda_coord: float = 5.0,
-        lambda_noobj: float = 0.5,
+        lambda_noobj: float = 0.1,
     ):
         super().__init__()
         self.S = S
@@ -139,11 +164,7 @@ class CustomCNNLoss(nn.Module):
         predictions: torch.Tensor,
         targets: torch.Tensor,
     ):
-        """
-        Assign GT objects to grid cells and select responsible predictors.
-        Predictions already have sigmoid on cx, cy, conf, class (applied in model).
-        w, h are raw — used directly for IoU in image-normalised coords.
-        """
+
         batch_size = predictions.shape[0]
         device = predictions.device
         cell_size = 1.0 / self.S
@@ -172,12 +193,11 @@ class CustomCNNLoss(nn.Module):
                 r, c = rows[idx].item(), cols[idx].item()
                 cls_id = cls_ids[idx].item()
 
-                # Decode pred boxes to image-level coords for correct IoU
                 pred_raw = predictions[b, r, c, :self.B * 5].reshape(self.B, 5)
-                pred_cx = (pred_raw[:, 0] + c) * cell_size    # sigmoid'd cx_rel → image cx
-                pred_cy = (pred_raw[:, 1] + r) * cell_size    # sigmoid'd cy_rel → image cy
-                pred_w  = pred_raw[:, 2]                       # raw w (image-normalised)
-                pred_h  = pred_raw[:, 3]                       # raw h (image-normalised)
+                pred_cx = (pred_raw[:, 0] + c) * cell_size
+                pred_cy = (pred_raw[:, 1] + r) * cell_size 
+                pred_w  = pred_raw[:, 2]
+                pred_h  = pred_raw[:, 3]
                 decoded = torch.stack([pred_cx, pred_cy, pred_w, pred_h], dim=-1)
 
                 gt_abs = torch.stack([cx[idx], cy[idx], w[idx], h[idx]])
@@ -199,10 +219,7 @@ class CustomCNNLoss(nn.Module):
         predictions: torch.Tensor,
         targets: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Predictions come from the model with sigmoid already applied to
-        cx, cy, conf, and class. w and h are raw.
-        """
+
         batch_size = predictions.shape[0]
 
         gt_box, gt_cls, obj_mask, best_iou_gt, responsible_idx = self._build_targets(
@@ -224,21 +241,27 @@ class CustomCNNLoss(nn.Module):
         obj  = obj_mask.float()
         obj4 = obj.unsqueeze(-1)
 
-        # Coordinate loss — cx, cy are sigmoid'd (0,1); w, h are raw
-        loss_xy = (obj * (
-            (pred_box_resp[..., 0] - gt_box[..., 0]) ** 2
-            + (pred_box_resp[..., 1] - gt_box[..., 1]) ** 2
-        )).sum()
+        # --- CIoU localization loss (replaces MSE xy + sqrt wh) ---
+        cell_size = 1.0 / self.S
+        dev = predictions.device
+        # Decode predicted boxes to absolute coords for CIoU
+        cols = torch.arange(self.S, device=dev).float().view(1, 1, self.S).expand(batch_size, self.S, self.S)
+        rows = torch.arange(self.S, device=dev).float().view(1, self.S, 1).expand(batch_size, self.S, self.S)
+        pred_abs = torch.stack([
+            (pred_box_resp[..., 0] + cols) * cell_size,
+            (pred_box_resp[..., 1] + rows) * cell_size,
+            pred_box_resp[..., 2].abs(),
+            pred_box_resp[..., 3].abs(),
+        ], dim=-1)
+        gt_abs = torch.stack([
+            (gt_box[..., 0] + cols) * cell_size,
+            (gt_box[..., 1] + rows) * cell_size,
+            gt_box[..., 2],
+            gt_box[..., 3],
+        ], dim=-1)
+        loss_coord = (obj * ciou(pred_abs, gt_abs)).sum()
 
-        eps = 1e-6
-        loss_wh = (obj * (
-            (pred_box_resp[..., 2].abs().add(eps).sqrt() - gt_box[..., 2].add(eps).sqrt()) ** 2
-            + (pred_box_resp[..., 3].abs().add(eps).sqrt() - gt_box[..., 3].add(eps).sqrt()) ** 2
-        )).sum()
-
-        loss_coord = loss_xy + loss_wh
-
-        # Confidence loss — conf is already sigmoid'd
+        # --- Confidence loss (MSE) ---
         loss_obj = (obj * (pred_conf_resp - best_iou_gt) ** 2).sum()
 
         resp_onehot = torch.zeros_like(pred_conf_all)
@@ -246,8 +269,10 @@ class CustomCNNLoss(nn.Module):
         noobj_mask = (~obj_mask).unsqueeze(-1) | (resp_onehot == 0)
         loss_noobj = (noobj_mask.float() * pred_conf_all ** 2).sum()
 
-        # Class loss — class scores are already sigmoid'd
-        loss_cls = (obj4 * (pred_cls - gt_cls) ** 2).sum()
+        # --- Classification loss (BCE with logits — numerically stable) ---
+        loss_cls = (obj4 * F.binary_cross_entropy_with_logits(
+            pred_cls, gt_cls, reduction='none'
+        )).sum()
 
         total = (
             self.lambda_coord * loss_coord
