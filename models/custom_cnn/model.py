@@ -64,7 +64,7 @@ class CustomCNN(nn.Module):
             nn.MaxPool2d(2, 2),                           # 56 to 28
         )
 
-        # Block 4 — 2× bottleneck + maxpool
+        # Block 4 - 2× bottleneck + maxpool
         self.block4 = nn.Sequential(
             _BottleneckBlock(256, 128, bn, res),
             _BottleneckBlock(256, 128, bn, res),
@@ -72,7 +72,7 @@ class CustomCNN(nn.Module):
             nn.MaxPool2d(2, 2),                           # 28 to 14
         )
 
-        # Block 5 — 2× bottleneck + convs
+        # Block 5 - 2× bottleneck + convs
         self.block5 = nn.Sequential(
             _BottleneckBlock(256, 128, bn, res),
             _BottleneckBlock(256, 128, bn, res),
@@ -80,7 +80,7 @@ class CustomCNN(nn.Module):
             _conv(256, 256, 3, use_batchnorm=bn),          # 14 to 14
         )
 
-        # Head — fully convolutional (no FC layers)
+        # Head - fully convolutional (no FC layers)
         out_ch = B * 5 + C
         self.head = nn.Sequential(
             _conv(256, 128, 1, use_batchnorm=bn),
@@ -106,7 +106,7 @@ class CustomCNN(nn.Module):
         x = self.head(x)                          # (batch, B*5+C, S, S)
         out = x.permute(0, 2, 3, 1).contiguous()  # (batch, S, S, B*5+C)
 
-        # Apply sigmoid to cx, cy, conf — leave w, h raw, classes as logits (BCE with logits in loss)
+        # Apply sigmoid to cx, cy, conf - leave w, h raw, classes as logits (BCE with logits in loss)
         sig_idx = []
         for i in range(self.B):
             base = i * 5
