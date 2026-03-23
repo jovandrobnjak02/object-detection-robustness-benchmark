@@ -14,6 +14,8 @@ data/night/
 data/overcast/
 data/rainy/
 data/snowy/
+results/metrics/
+.claude/
 
 # ── Model checkpoints & weights ───────────────────────────
 checkpoints/

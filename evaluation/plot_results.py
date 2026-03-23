@@ -321,7 +321,7 @@ def plot_loss_curves():
 def _plot_single_confusion_matrix(ax, matrix: np.ndarray, title: str):
     """Plot a normalized (by GT column) confusion matrix on the given axes."""
     n = len(CLASS_NAMES)
-    cm = np.array(matrix[:n, :n], dtype=float)  # exclude background row/col
+    cm = np.array(matrix, dtype=float)[:n, :n]  # exclude background row/col
 
     col_sums = cm.sum(axis=0, keepdims=True)
     col_sums[col_sums == 0] = 1

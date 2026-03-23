@@ -20,9 +20,9 @@ NMS_THRESH   = 0.45
 IOU_THRESH   = 0.5   # mAP@50
 
 CUSTOM_CNN_CKPT = Path("checkpoints/custom_cnn/bdd100k_custom_cnn_best.pt")
-YOLO26_CKPT     = Path("checkpoints/yolo26/bdd100k/weights/best.pt")
+YOLO26_CKPT     = Path("checkpoints/yolo26/yolo26n/weights/best.pt")
 
-SPLITS = ["clear_day/val", "rainy", "snowy", "night", "overcast"]
+SPLITS = ["clear_day/val"]
 
 CLASS_NAMES = [
     "car", "person", "traffic sign", "traffic light",
