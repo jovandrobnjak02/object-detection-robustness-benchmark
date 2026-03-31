@@ -36,13 +36,15 @@ def compute_map(
     num_classes: int,
     iou_thresh: float = 0.5,
 ) -> tuple[float, list[float], list[float], list[float]]:
-    gt_by_img_cls: dict[tuple, list] = {}
+    # Pre-convert GT boxes to numpy arrays once, keyed by (img_id, cls)
+    gt_by_img_cls: dict[tuple, np.ndarray] = {}
+    _tmp: dict[tuple, list] = {}
     for gt in all_gts:
         img_id = gt["img_id"]
         for box in gt["boxes"]:
             cls = int(box[4])
-            key = (img_id, cls)
-            gt_by_img_cls.setdefault(key, []).append(box[:4])
+            _tmp.setdefault((img_id, cls), []).append(box[:4])
+    gt_by_img_cls = {k: np.array(v) for k, v in _tmp.items()}
 
     aps, precisions_out, recalls_out = [], [], []
 
@@ -74,8 +76,7 @@ def compute_map(
                 fp[i] = 1
                 continue
 
-            gt_arr = np.array(gt_boxes)
-            ious = compute_iou_np(np.array(pred_box), gt_arr)
+            ious = compute_iou_np(np.array(pred_box), gt_boxes)
             best_iou_idx = int(np.argmax(ious))
             best_iou = ious[best_iou_idx]
 
