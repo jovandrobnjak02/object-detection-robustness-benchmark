@@ -127,7 +127,6 @@ def _decode_single(
 
 def decode_predictions(
     predictions,
-    S: int = 14,
     B: int = 2,
     C: int = 10,
     conf_thresh: float = 0.25,
