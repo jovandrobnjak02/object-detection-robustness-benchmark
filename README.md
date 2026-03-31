@@ -1,18 +1,16 @@
 # Object Detection Robustness Benchmark
 
-Thesis project comparing a custom CNN trained from scratch against YOLO26n on the BDD100K dataset. Models are trained on clear daytime conditions and evaluated on adverse weather and lighting conditions to measure robustness.
+Thesis project comparing a custom CNN (ResNet-50 + FPN) against YOLO26m on the BDD100K dataset. Models are trained on clear daytime conditions and evaluated on adverse weather and lighting conditions to measure robustness.
 
 ## Models
 
-**Custom CNN**:  Architecture built from scratch in PyTorch.
-- Fully convolutional detection head (no FC layers)
-- 14×14 detection grid, 2 anchor boxes per cell, 10 classes
-- ~3.5M parameters
-- Ablation variants: baseline, +BatchNorm, +BatchNorm+Residual (full)
-- Trained with mosaic augmentation, letterboxing, LR warmup, AdamW
+**Custom CNN**: ResNet-50 backbone (pretrained on ImageNet) + FPN neck + shared detection head.
+- Multi-scale detection across 3 FPN levels (P3, P4, P5)
+- 2 anchor boxes per cell, 10 classes
+- Backbone frozen during warmup, then fully fine-tuned
+- AdamW optimizer, LR warmup + cosine annealing, mixed precision
 
-**YOLO26n** - Ultralytics YOLO26 nano, pretrained on COCO, fine-tuned on BDD100K.
-- ~2.6M parameters
+**YOLO26m** - Ultralytics YOLO26 medium, pretrained on COCO, fine-tuned on BDD100K.
 - Anchor-free, multi-scale detection
 
 ## Dataset
@@ -40,12 +38,12 @@ See [data/README.md](data/README.md) for setup instructions.
 │   └── bdd100k_dataset.py      PyTorch Dataset with letterboxing + mosaic augmentation
 ├── models/custom_cnn/
 │   ├── model.py                Custom CNN architecture
-│   └── loss.py                 YOLOv1 loss, decode_predictions, NMS
+│   └── loss.py                 Detection loss, decode_predictions, NMS
 ├── training/
 │   ├── train_custom_cnn.py     Custom CNN training script
 │   └── train_yolo26.py         YOLO26 fine-tuning script
 ├── evaluation/
-│   ├── evaluate.py             Evaluate both models on all splits → JSON + CSV
+│   ├── evaluate.py             Evaluate both models → JSON + CSV
 │   └── plot_results.py         Generate thesis plots from evaluation results
 ├── scripts/
 │   ├── prepare_bdd100k.py      Filter + convert BDD100K to YOLO format
@@ -84,7 +82,7 @@ python scripts/cache_to_shm.py 0.5    # 50% of training data
 python training/train_custom_cnn.py
 
 # YOLO26
-python training/train_yolo26.py
+python training/train_yolo26.py --model yolo26m
 ```
 
 ### 4. Evaluate
