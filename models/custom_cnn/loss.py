@@ -190,37 +190,59 @@ class CustomCNNLoss(nn.Module):
         for b in range(batch_size):
             gt = targets[b]
             gt = gt[gt[:, 0] >= 0]
-            if gt.numel() == 0:
+            if gt.shape[0] == 0:
                 continue
 
             cls_ids = gt[:, 0].long()
             cx, cy, w, h = gt[:, 1], gt[:, 2], gt[:, 3], gt[:, 4]
 
-            cols = (cx / cell_size).long().clamp(max=S - 1)
-            rows = (cy / cell_size).long().clamp(max=S - 1)
-            cx_rel = cx / cell_size - cols.float()
-            cy_rel = cy / cell_size - rows.float()
+            col_f = cx / cell_size
+            row_f = cy / cell_size
+            cols  = col_f.long().clamp(0, S - 1)   # (N,)
+            rows  = row_f.long().clamp(0, S - 1)   # (N,)
+            cx_rel = col_f - cols.float()
+            cy_rel = row_f - rows.float()
 
-            for idx in range(gt.shape[0]):
-                r, c = rows[idx].item(), cols[idx].item()
-                cls_id = cls_ids[idx].item()
+            # Vectorized: get predicted boxes at all GT cell locations (N, B, 5)
+            pred_at = predictions[b, rows, cols, :self.B * 5].reshape(-1, self.B, 5)
 
-                pred_raw = predictions[b, r, c, :self.B * 5].reshape(self.B, 5)
-                pred_cx = (pred_raw[:, 0] + c) * cell_size
-                pred_cy = (pred_raw[:, 1] + r) * cell_size
-                decoded = torch.stack([pred_cx, pred_cy, pred_raw[:, 2], pred_raw[:, 3]], dim=-1)
+            # Decode predicted boxes (N, B)
+            p_cx = (pred_at[:, :, 0] + cols.float().unsqueeze(1)) * cell_size
+            p_cy = (pred_at[:, :, 1] + rows.float().unsqueeze(1)) * cell_size
+            p_w  = pred_at[:, :, 2]
+            p_h  = pred_at[:, :, 3]
 
-                gt_abs = torch.stack([cx[idx], cy[idx], w[idx], h[idx]])
-                ious = iou(decoded, gt_abs.unsqueeze(0).expand(self.B, -1))
-                best_j = int(ious.argmax().item())
+            g_cx = cx.unsqueeze(1).expand(-1, self.B)
+            g_cy = cy.unsqueeze(1).expand(-1, self.B)
+            g_w  = w.unsqueeze(1).expand(-1, self.B)
+            g_h  = h.unsqueeze(1).expand(-1, self.B)
 
-                if not obj_mask[b, r, c] or ious[best_j] > best_iou_gt[b, r, c]:
-                    obj_mask[b, r, c]        = True
-                    gt_box[b, r, c]          = torch.stack([cx_rel[idx], cy_rel[idx], w[idx], h[idx]])
-                    best_iou_gt[b, r, c]     = ious[best_j]
-                    responsible_idx[b, r, c] = best_j
+            ious = iou(
+                torch.stack([p_cx, p_cy, p_w, p_h], dim=-1),
+                torch.stack([g_cx, g_cy, g_w, g_h], dim=-1),
+            )  # (N, B)
 
-                gt_cls[b, r, c, cls_id] = 1.0
+            best_js       = ious.argmax(dim=1)        # (N,)
+            best_iou_vals = ious.max(dim=1).values    # (N,)
+
+            flat_idx = rows * S + cols  # (N,) flat index into S×S grid
+
+            # Scatter into flat grid (last GT for a given cell wins)
+            ones = torch.ones(len(flat_idx), dtype=torch.bool, device=device)
+            obj_mask[b].view(-1).scatter_(0, flat_idx, ones)
+            best_iou_gt[b].view(-1).scatter_(0, flat_idx, best_iou_vals)
+            responsible_idx[b].view(-1).scatter_(0, flat_idx, best_js)
+
+            gt_box_vals = torch.stack([cx_rel, cy_rel, w, h], dim=1)   # (N, 4)
+            gt_box[b].view(S * S, 4).scatter_(
+                0, flat_idx.unsqueeze(1).expand(-1, 4), gt_box_vals
+            )
+
+            gt_cls[b].view(S * S, self.C).scatter_(
+                0,
+                flat_idx.unsqueeze(1).expand(-1, self.C),
+                F.one_hot(cls_ids, self.C).float(),
+            )
 
         return gt_box, gt_cls, obj_mask, best_iou_gt, responsible_idx
 
