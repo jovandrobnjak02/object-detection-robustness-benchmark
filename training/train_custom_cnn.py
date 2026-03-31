@@ -5,23 +5,27 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
+from datasets.bdd100k_dataset import BDD100KDataset, get_dataloader
+from models.custom_cnn import CustomCNN, CustomCNNLoss, decode_predictions, nms
+from evaluation.metrics import compute_map, box_cxcywh_to_xyxy
 
-from datasets.bdd100k_dataset import get_dataloader
-from models.custom_cnn import CustomCNN, CustomCNNLoss
-
-EPOCHS         = 200
-WARMUP_EPOCHS  = 5
-BATCH_SIZE     = 128
-NUM_WORKERS    = 8
+EPOCHS         = 50
+WARMUP_EPOCHS  = 3
+BATCH_SIZE     = 64
+NUM_WORKERS    = 4
 IMG_SIZE       = 448
-LR             = 1e-4
+LR             = 1e-3
 NUM_CLASSES    = 10
+MAP_EVAL_EVERY = 5     # compute val mAP every N epochs
+CONF_THRESH    = 0.25
+NMS_THRESH     = 0.45
 
-CHECKPOINTS    = Path(__file__).parent.parent / "checkpoints" / "custom_cnn"
-LOGS           = Path(__file__).parent.parent / "results" / "logs"
+CHECKPOINTS = Path(__file__).parent.parent / "checkpoints" / "custom_cnn"
+LOGS        = Path(__file__).parent.parent / "results" / "logs"
 
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device):
@@ -35,7 +39,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device):
         optimizer.zero_grad(set_to_none=True)
         with autocast("cuda"):
             preds = model(images)
-            loss  = criterion(preds.float(), labels)
+            loss  = criterion(preds, labels)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -57,8 +61,52 @@ def run_val(model, loader, criterion, device):
         labels = labels.to(device, non_blocking=True)
         with autocast("cuda"):
             preds = model(images)
-            total_loss += criterion(preds.float(), labels).item()
+            total_loss += criterion(preds, labels).item()
     return total_loss / len(loader)
+
+
+@torch.no_grad()
+def compute_val_map(model, val_dataset: BDD100KDataset, device: torch.device) -> float:
+    model.eval()
+    all_preds = []
+    stems = val_dataset.samples
+
+    # Batched inference
+    batch_size = 32
+    for start in range(0, len(stems), batch_size):
+        batch_stems = stems[start:start + batch_size]
+        imgs = []
+        for stem in batch_stems:
+            img = val_dataset._load_image(stem)
+            imgs.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
+        batch = torch.stack(imgs).to(device)
+
+        preds = model(batch)
+        detections = decode_predictions(preds, conf_thresh=CONF_THRESH)
+
+        for i, dets_raw in enumerate(detections):
+            img_id = start + i
+            dets = nms(dets_raw, iou_thresh=NMS_THRESH)
+            boxes = []
+            if dets.shape[0] > 0:
+                d = dets.cpu().numpy()
+                xyxy = box_cxcywh_to_xyxy(d[:, :4])
+                boxes = np.column_stack([xyxy, d[:, 4], d[:, 6]]).tolist()
+            all_preds.append({"img_id": img_id, "boxes": boxes})
+
+    # Build GT from label cache
+    all_gts = []
+    for img_id, stem in enumerate(stems):
+        labels = val_dataset._label_cache[stem]
+        if labels.shape[0] > 0:
+            xyxy = box_cxcywh_to_xyxy(labels[:, 1:].numpy())
+            cls  = labels[:, 0:1].numpy()
+            all_gts.append({"img_id": img_id, "boxes": np.concatenate([xyxy, cls], axis=1)})
+        else:
+            all_gts.append({"img_id": img_id, "boxes": []})
+
+    map_val, _, _, _ = compute_map(all_preds, all_gts, NUM_CLASSES)
+    return map_val
 
 
 def train():
@@ -68,27 +116,40 @@ def train():
     print(f"Device: {device}")
 
     tag = "bdd100k_custom_cnn"
-    print(f"Run: {tag} (full variant, C={NUM_CLASSES})")
+    print(f"Run: {tag} (ResNet-50 + FPN, C={NUM_CLASSES})")
 
     CHECKPOINTS.mkdir(parents=True, exist_ok=True)
     LOGS.mkdir(parents=True, exist_ok=True)
     log_path = LOGS / f"{tag}.csv"
 
-    train_loader = get_dataloader("clear_day/train", img_size=IMG_SIZE, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
-    val_loader   = get_dataloader("clear_day/val",   img_size=IMG_SIZE, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False)
+    train_loader = get_dataloader(
+        "clear_day/train", img_size=IMG_SIZE, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS
+    )
+    val_loader = get_dataloader(
+        "clear_day/val", img_size=IMG_SIZE, batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS, shuffle=False
+    )
+    val_dataset: BDD100KDataset = val_loader.dataset
 
-    # Full variant: BN + residual, 10 classes
-    raw_model = CustomCNN(C=NUM_CLASSES, use_batchnorm=True, use_residual=True).to(device)
+    raw_model = CustomCNN(C=NUM_CLASSES).to(device)
     criterion = CustomCNNLoss(C=NUM_CLASSES)
     optimizer = optim.AdamW(raw_model.parameters(), lr=LR, weight_decay=1e-4)
     warmup_sched = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=WARMUP_EPOCHS)
-    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - WARMUP_EPOCHS, eta_min=1e-6)
-    scheduler = optim.lr_scheduler.SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[WARMUP_EPOCHS])
-    scaler    = GradScaler("cuda")
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS - WARMUP_EPOCHS, eta_min=1e-6
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, [warmup_sched, cosine_sched], milestones=[WARMUP_EPOCHS]
+    )
+    scaler = GradScaler("cuda")
 
     start_epoch = 1
     best_val    = float("inf")
     resume_path = CHECKPOINTS / f"{tag}_latest.pt"
+
+    # Freeze backbone during warmup (only train FPN + head)
+    raw_model.freeze_backbone()
+    print("Backbone frozen for warmup.")
 
     try:
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
@@ -100,7 +161,11 @@ def train():
             scaler.load_state_dict(ckpt["scaler_state"])
         start_epoch = ckpt["epoch"] + 1
         best_val    = ckpt["val_loss"]
-        print(f"Resumed from epoch {ckpt['epoch']}, val_loss {ckpt['val_loss']:.4f}")
+        if start_epoch > WARMUP_EPOCHS:
+            raw_model.unfreeze_backbone()
+            print(f"Resumed from epoch {ckpt['epoch']} (backbone unfrozen), val_loss {ckpt['val_loss']:.4f}")
+        else:
+            print(f"Resumed from epoch {ckpt['epoch']} (backbone frozen), val_loss {ckpt['val_loss']:.4f}")
     except FileNotFoundError:
         pass
     except (RuntimeError, KeyError) as e:
@@ -109,37 +174,52 @@ def train():
 
     if not log_path.exists() or log_path.stat().st_size == 0:
         with open(log_path, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "lr", "epoch_time_s", "gpu_peak_mem_mb"])
+            csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "map50", "lr", "epoch_time_s"])
 
     model = torch.compile(raw_model)
 
     for epoch in range(start_epoch, EPOCHS + 1):
+        # Unfreeze backbone after warmup
+        if epoch == WARMUP_EPOCHS + 1:
+            raw_model.unfreeze_backbone()
+            print("Backbone unfrozen.")
+
         if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         train_loss = run_epoch(model, train_loader, criterion, optimizer, scaler, device)
         val_loss   = run_val(model, val_loader, criterion, device)
         scheduler.step()
-        elapsed    = time.time() - t0
-        gpu_mem_mb = torch.cuda.max_memory_allocated(device) / 1024**2 if torch.cuda.is_available() else 0.0
+        elapsed = time.time() - t0
+
+        # mAP evaluation every MAP_EVAL_EVERY epochs
+        map50 = ""
+        if epoch % MAP_EVAL_EVERY == 0 or epoch == EPOCHS:
+            map50_val = compute_val_map(raw_model, val_dataset, device)
+            map50 = f"{map50_val * 100:.2f}"
 
         current_lr = optimizer.param_groups[0]["lr"]
+        gpu_mb = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
+        map_str = f" | mAP50={map50}%" if map50 else ""
         print(
             f"Epoch {epoch:3d}/{EPOCHS} | "
-            f"train {train_loss:.4f} | val {val_loss:.4f} | "
-            f"lr {current_lr:.2e} | {elapsed:.0f}s | GPU {gpu_mem_mb:.0f}MB"
+            f"train {train_loss:.4f} | val {val_loss:.4f}{map_str} | "
+            f"lr {current_lr:.2e} | {elapsed:.0f}s | GPU {gpu_mb:.0f}MB"
         )
 
         with open(log_path, "a", newline="") as f:
-            csv.writer(f).writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{current_lr:.2e}", f"{elapsed:.1f}", f"{gpu_mem_mb:.0f}"])
+            csv.writer(f).writerow([
+                epoch, f"{train_loss:.6f}", f"{val_loss:.6f}",
+                map50, f"{current_lr:.2e}", f"{elapsed:.1f}",
+            ])
 
         ckpt = {
-            "epoch": epoch,
-            "model_state": raw_model.state_dict(),
+            "epoch":           epoch,
+            "model_state":     raw_model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
-            "scaler_state": scaler.state_dict(),
-            "val_loss": val_loss,
+            "scaler_state":    scaler.state_dict(),
+            "val_loss":        val_loss,
         }
         torch.save(ckpt, CHECKPOINTS / f"{tag}_latest.pt")
 

@@ -1,116 +1,93 @@
+import math
 import torch
 import torch.nn as nn
+import torchvision.models as models
+from torchvision.ops import FeaturePyramidNetwork
 
 
-S = 14  # grid size
 B = 2   # boxes per cell
 C = 10  # number of classes
-
-
-def _conv(in_ch, out_ch, k, s=1, p=None, use_batchnorm=False):
-    if p is None:
-        p = k // 2
-    layers = [nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, bias=not use_batchnorm)]
-    if use_batchnorm:
-        layers.append(nn.BatchNorm2d(out_ch))
-    layers.append(nn.LeakyReLU(0.1, inplace=True))
-    return nn.Sequential(*layers)
-
-
-class _BottleneckBlock(nn.Module):
-
-    def __init__(self, ch_in, ch_mid, use_batchnorm: bool, use_residual: bool):
-        super().__init__()
-        self.conv1 = _conv(ch_in,  ch_mid, 1, use_batchnorm=use_batchnorm)
-        self.conv2 = _conv(ch_mid, ch_in,  3, use_batchnorm=use_batchnorm)
-        self.use_residual = use_residual
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv2(self.conv1(x))
-        if self.use_residual:
-            out = out + x
-        return out
+FPN_OUT = 256
 
 
 class CustomCNN(nn.Module):
-    def __init__(
-        self,
-        S: int = S,
-        B: int = B,
-        C: int = C,
-        use_batchnorm: bool = False,
-        use_residual: bool = False,
-    ):
+    def __init__(self, B: int = B, C: int = C):
         super().__init__()
-        self.S = S
         self.B = B
         self.C = C
 
-        bn = use_batchnorm
-        res = use_residual
+        # Pretrained ResNet-50 backbone
+        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+        self.stem   = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
+        self.layer1 = resnet.layer1  # 256ch
+        self.layer2 = resnet.layer2  # 512ch
+        self.layer3 = resnet.layer3  # 1024ch
+        self.layer4 = resnet.layer4  # 2048ch
 
-        self.stem = nn.Sequential(
-            # Block 1
-            _conv(3, 32, 7, s=2, use_batchnorm=bn),     # 448 to 224
-            nn.MaxPool2d(2, 2),                           # 224 to 112
-
-            # Block 2
-            _conv(32, 96, 3, use_batchnorm=bn),
-            nn.MaxPool2d(2, 2),                           # 112 to 56
-
-            # Block 3
-            _conv(96, 128, 1, use_batchnorm=bn),
-            _conv(128, 256, 3, use_batchnorm=bn),
-            nn.MaxPool2d(2, 2),                           # 56 to 28
+        # FPN
+        self.fpn = FeaturePyramidNetwork(
+            in_channels_list=[512, 1024, 2048],
+            out_channels=FPN_OUT,
         )
 
-        # Block 4 - 2× bottleneck + maxpool
-        self.block4 = nn.Sequential(
-            _BottleneckBlock(256, 128, bn, res),
-            _BottleneckBlock(256, 128, bn, res),
-            _conv(256, 256, 3, use_batchnorm=bn),
-            nn.MaxPool2d(2, 2),                           # 28 to 14
-        )
-
-        # Block 5 - 2× bottleneck + convs
-        self.block5 = nn.Sequential(
-            _BottleneckBlock(256, 128, bn, res),
-            _BottleneckBlock(256, 128, bn, res),
-            _conv(256, 256, 3, use_batchnorm=bn),
-            _conv(256, 256, 3, use_batchnorm=bn),          # 14 to 14
-        )
-
-        # Head - fully convolutional (no FC layers)
+        # Shared detection head
         out_ch = B * 5 + C
         self.head = nn.Sequential(
-            _conv(256, 128, 1, use_batchnorm=bn),
-            nn.Conv2d(128, out_ch, 1),  # raw output, no activation
+            nn.Conv2d(FPN_OUT, 128, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(128, out_ch, 1),
         )
 
-        self._init_weights()
+        # Precompute sigmoid indices: cx, cy, conf for each box predictor
+        self._sig_idx = []
+        for i in range(B):
+            base = i * 5
+            self._sig_idx.extend([base, base + 1, base + 4])
 
-    def _init_weights(self):
-        for m in self.modules():
+        self._init_head_weights()
+
+    def _init_head_weights(self):
+        for m in self.head.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, a=0.1, mode="fan_out", nonlinearity="leaky_relu")
+                nn.init.kaiming_normal_(m.weight, a=0.1, mode="fan_out",
+                                        nonlinearity="leaky_relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = self.block4(x)
-        x = self.block5(x)
-        x = self.head(x)                          # (batch, B*5+C, S, S)
-        out = x.permute(0, 2, 3, 1).contiguous()  # (batch, S, S, B*5+C)
+        # Proper bias init for classification outputs
+        pi = 0.01
+        with torch.no_grad():
+            self.head[-1].bias[self.B * 5:].fill_(-math.log((1 - pi) / pi))
 
-        # Apply sigmoid to cx, cy, conf - leave w, h raw, classes as logits (BCE with logits in loss)
-        sig_idx = []
-        for i in range(self.B):
-            base = i * 5
-            sig_idx.extend([base, base + 1, base + 4])  # cx, cy, conf
-        out[..., sig_idx] = torch.sigmoid(out[..., sig_idx])
+    def freeze_backbone(self):
+        for mod in [self.stem, self.layer1, self.layer2, self.layer3, self.layer4]:
+            for p in mod.parameters():
+                p.requires_grad = False
 
+    def unfreeze_backbone(self):
+        for p in self.parameters():
+            p.requires_grad = True
+
+    def _apply_head(self, feat: torch.Tensor) -> torch.Tensor:
+        out = self.head(feat).permute(0, 2, 3, 1).contiguous()  # (B, S, S, out_ch)
+        out[..., self._sig_idx] = torch.sigmoid(out[..., self._sig_idx])
         return out
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        x  = self.stem(x)
+        x  = self.layer1(x)
+        c3 = self.layer2(x)   # 512ch
+        c4 = self.layer3(c3)  # 1024ch
+        c5 = self.layer4(c4)  # 2048ch
+
+        fpn_out = self.fpn({"c3": c3, "c4": c4, "c5": c5})
+
+        return [
+            self._apply_head(fpn_out["c3"]),  # P3
+            self._apply_head(fpn_out["c4"]),  # P4
+            self._apply_head(fpn_out["c5"]),  # P5
+        ]

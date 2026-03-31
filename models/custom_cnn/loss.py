@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import batched_nms
 
 
 def iou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
@@ -32,7 +33,6 @@ def iou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
 
 def ciou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
     eps = 1e-7
-    # Convert to corners
     px1 = box_pred[..., 0] - box_pred[..., 2] / 2
     py1 = box_pred[..., 1] - box_pred[..., 3] / 2
     px2 = box_pred[..., 0] + box_pred[..., 2] / 2
@@ -43,7 +43,6 @@ def ciou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
     gx2 = box_gt[..., 0] + box_gt[..., 2] / 2
     gy2 = box_gt[..., 1] + box_gt[..., 3] / 2
 
-    # IoU
     inter_x1 = torch.max(px1, gx1)
     inter_y1 = torch.max(py1, gy1)
     inter_x2 = torch.min(px2, gx2)
@@ -54,17 +53,14 @@ def ciou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
     union = area_p + area_g - inter
     iou_val = inter / (union + eps)
 
-    # Center distance penalty
     rho2 = (box_pred[..., 0] - box_gt[..., 0]) ** 2 + \
            (box_pred[..., 1] - box_gt[..., 1]) ** 2
-    # Diagonal of smallest enclosing box
     enc_x1 = torch.min(px1, gx1)
     enc_y1 = torch.min(py1, gy1)
     enc_x2 = torch.max(px2, gx2)
     enc_y2 = torch.max(py2, gy2)
     c2 = (enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2 + eps
 
-    # Aspect ratio penalty
     v = (4 / (math.pi ** 2)) * (
         torch.atan(box_gt[..., 2] / (box_gt[..., 3] + eps))
         - torch.atan(box_pred[..., 2] / (box_pred[..., 3] + eps))
@@ -75,105 +71,122 @@ def ciou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
     return 1 - iou_val + rho2 / c2 + alpha * v
 
 
+def focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: float = 0.25,
+) -> torch.Tensor:
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p = torch.sigmoid(logits)
+    p_t = targets * p + (1 - targets) * (1 - p)
+    alpha_t = targets * alpha + (1 - targets) * (1 - alpha)
+    return alpha_t * (1 - p_t) ** gamma * bce
+
+
+def _decode_single(
+    pred: torch.Tensor,
+    S: int,
+    B: int,
+    C: int,
+    conf_thresh: float,
+) -> list[torch.Tensor]:
+    N = pred.shape[0]
+    device = pred.device
+    cell_size = 1.0 / S
+
+    rows = torch.arange(S, device=device).float().view(1, S, 1).expand(N, S, S)
+    cols = torch.arange(S, device=device).float().view(1, 1, S).expand(N, S, S)
+
+    # Class scores — batched over N
+    best_cls_conf, best_cls = pred[:, :, :, B * 5:].sigmoid().max(dim=3)  # (N, S, S)
+
+    all_dets = []
+    for j in range(B):
+        base = j * 5
+        cx   = (pred[:, :, :, base + 0] + cols) * cell_size  # (N, S, S)
+        cy   = (pred[:, :, :, base + 1] + rows) * cell_size
+        w    = pred[:, :, :, base + 2].abs()
+        h    = pred[:, :, :, base + 3].abs()
+        conf = pred[:, :, :, base + 4]
+
+        dets = torch.stack([
+            cx.flatten(1), cy.flatten(1), w.flatten(1), h.flatten(1),
+            conf.flatten(1), best_cls_conf.flatten(1), best_cls.float().flatten(1),
+        ], dim=2)  # (N, S*S, 7)
+        all_dets.append(dets)
+
+    all_dets = torch.cat(all_dets, dim=1)  # (N, S*S*B, 7)
+
+    results = []
+    for b in range(N):
+        mask = all_dets[b, :, 4] >= conf_thresh
+        results.append(all_dets[b][mask] if mask.any() else torch.zeros((0, 7), device=device))
+    return results
+
+
 def decode_predictions(
-    predictions: torch.Tensor,
+    predictions,
     S: int = 14,
     B: int = 2,
     C: int = 10,
     conf_thresh: float = 0.25,
 ) -> list[torch.Tensor]:
-    batch_size = predictions.shape[0]
-    cell_size = 1.0 / S
-    results = []
+    if isinstance(predictions, list):
+        device = predictions[0].device
+        scale_results = [
+            _decode_single(p, p.shape[1], B, C, conf_thresh) for p in predictions
+        ]
+        batch_size = len(scale_results[0])
+        merged = []
+        for b in range(batch_size):
+            dets = [s[b] for s in scale_results if s[b].shape[0] > 0]
+            if dets:
+                merged.append(torch.cat(dets, dim=0))
+            else:
+                merged.append(torch.zeros((0, 7), device=device))
+        return merged
 
-    for b in range(batch_size):
-        detections = []
-        pred = predictions[b]  # (S, S, B*5+C)
-
-        for row in range(S):
-            for col in range(S):
-                class_scores = pred[row, col, B * 5:].sigmoid()  # logits → probs
-                best_cls_conf, best_cls = class_scores.max(0)
-
-                for j in range(B):
-                    base = j * 5
-                    conf = pred[row, col, base + 4]
-
-                    if conf < conf_thresh:
-                        continue
-
-                    cx = (pred[row, col, base + 0] + col) * cell_size
-                    cy = (pred[row, col, base + 1] + row) * cell_size
-                    w  = pred[row, col, base + 2]
-                    h  = pred[row, col, base + 3]
-
-                    detections.append(torch.stack([
-                        cx, cy, w.abs(), h.abs(), conf, best_cls_conf, best_cls.float()
-                    ]))
-
-        if detections:
-            results.append(torch.stack(detections))
-        else:
-            results.append(torch.zeros((0, 7), device=predictions.device))
-
-    return results
+    return _decode_single(predictions, S, B, C, conf_thresh)
 
 
 def nms(detections: torch.Tensor, iou_thresh: float = 0.5) -> torch.Tensor:
     if detections.shape[0] == 0:
         return detections
 
-    keep = []
-    order = detections[:, 4].argsort(descending=True)
-    detections = detections[order]
+    cx, cy, w, h = detections[:, 0], detections[:, 1], detections[:, 2], detections[:, 3]
+    boxes_xyxy = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=1)
+    scores  = detections[:, 4]
+    cls_ids = detections[:, 6].long()
 
-    while detections.shape[0] > 0:
-        keep.append(detections[0])
-        if detections.shape[0] == 1:
-            break
-
-        ious = iou(
-            detections[0, :4].unsqueeze(0).expand(detections.shape[0] - 1, -1),
-            detections[1:, :4],
-        )
-        same_class = detections[1:, 6] == detections[0, 6]
-        suppress = (ious > iou_thresh) & same_class
-        detections = detections[1:][~suppress]
-
-    return torch.stack(keep)
+    keep = batched_nms(boxes_xyxy, scores, cls_ids, iou_thresh)
+    return detections[keep]
 
 
 class CustomCNNLoss(nn.Module):
     def __init__(
         self,
-        S: int = 14,
         B: int = 2,
         C: int = 10,
         lambda_coord: float = 5.0,
         lambda_noobj: float = 0.1,
     ):
         super().__init__()
-        self.S = S
         self.B = B
         self.C = C
         self.lambda_coord = lambda_coord
         self.lambda_noobj = lambda_noobj
 
-    def _build_targets(
-        self,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-    ):
-
+    def _build_targets(self, predictions: torch.Tensor, targets: torch.Tensor, S: int):
         batch_size = predictions.shape[0]
         device = predictions.device
-        cell_size = 1.0 / self.S
+        cell_size = 1.0 / S
 
-        gt_box          = torch.zeros(batch_size, self.S, self.S, 4, device=device)
-        gt_cls          = torch.zeros(batch_size, self.S, self.S, self.C, device=device)
-        obj_mask        = torch.zeros(batch_size, self.S, self.S, dtype=torch.bool, device=device)
-        best_iou_gt     = torch.zeros(batch_size, self.S, self.S, device=device)
-        responsible_idx = torch.zeros(batch_size, self.S, self.S, dtype=torch.long, device=device)
+        gt_box          = torch.zeros(batch_size, S, S, 4, device=device)
+        gt_cls          = torch.zeros(batch_size, S, S, self.C, device=device)
+        obj_mask        = torch.zeros(batch_size, S, S, dtype=torch.bool, device=device)
+        best_iou_gt     = torch.zeros(batch_size, S, S, device=device)
+        responsible_idx = torch.zeros(batch_size, S, S, dtype=torch.long, device=device)
 
         for b in range(batch_size):
             gt = targets[b]
@@ -184,8 +197,8 @@ class CustomCNNLoss(nn.Module):
             cls_ids = gt[:, 0].long()
             cx, cy, w, h = gt[:, 1], gt[:, 2], gt[:, 3], gt[:, 4]
 
-            cols = (cx / cell_size).long().clamp(max=self.S - 1)
-            rows = (cy / cell_size).long().clamp(max=self.S - 1)
+            cols = (cx / cell_size).long().clamp(max=S - 1)
+            rows = (cy / cell_size).long().clamp(max=S - 1)
             cx_rel = cx / cell_size - cols.float()
             cy_rel = cy / cell_size - rows.float()
 
@@ -195,10 +208,8 @@ class CustomCNNLoss(nn.Module):
 
                 pred_raw = predictions[b, r, c, :self.B * 5].reshape(self.B, 5)
                 pred_cx = (pred_raw[:, 0] + c) * cell_size
-                pred_cy = (pred_raw[:, 1] + r) * cell_size 
-                pred_w  = pred_raw[:, 2]
-                pred_h  = pred_raw[:, 3]
-                decoded = torch.stack([pred_cx, pred_cy, pred_w, pred_h], dim=-1)
+                pred_cy = (pred_raw[:, 1] + r) * cell_size
+                decoded = torch.stack([pred_cx, pred_cy, pred_raw[:, 2], pred_raw[:, 3]], dim=-1)
 
                 gt_abs = torch.stack([cx[idx], cy[idx], w[idx], h[idx]])
                 ious = iou(decoded, gt_abs.unsqueeze(0).expand(self.B, -1))
@@ -214,23 +225,16 @@ class CustomCNNLoss(nn.Module):
 
         return gt_box, gt_cls, obj_mask, best_iou_gt, responsible_idx
 
-    def forward(
-        self,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> torch.Tensor:
-
+    def _forward_single(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        S = predictions.shape[1]
         batch_size = predictions.shape[0]
 
         gt_box, gt_cls, obj_mask, best_iou_gt, responsible_idx = self._build_targets(
-            predictions, targets
+            predictions, targets, S
         )
 
-        pred_boxes_all = predictions[..., : self.B * 5].reshape(
-            batch_size, self.S, self.S, self.B, 5
-        )
-
-        pred_cls = predictions[..., self.B * 5 :]
+        pred_boxes_all = predictions[..., :self.B * 5].reshape(batch_size, S, S, self.B, 5)
+        pred_cls = predictions[..., self.B * 5:]
 
         resp_idx = responsible_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, 5)
         pred_resp = pred_boxes_all.gather(3, resp_idx).squeeze(3)
@@ -241,12 +245,12 @@ class CustomCNNLoss(nn.Module):
         obj  = obj_mask.float()
         obj4 = obj.unsqueeze(-1)
 
-        # --- CIoU localization loss (replaces MSE xy + sqrt wh) ---
-        cell_size = 1.0 / self.S
+        # CIoU localization loss
+        cell_size = 1.0 / S
         dev = predictions.device
-        # Decode predicted boxes to absolute coords for CIoU
-        cols = torch.arange(self.S, device=dev).float().view(1, 1, self.S).expand(batch_size, self.S, self.S)
-        rows = torch.arange(self.S, device=dev).float().view(1, self.S, 1).expand(batch_size, self.S, self.S)
+        cols = torch.arange(S, device=dev).float().view(1, 1, S).expand(batch_size, S, S)
+        rows = torch.arange(S, device=dev).float().view(1, S, 1).expand(batch_size, S, S)
+
         pred_abs = torch.stack([
             (pred_box_resp[..., 0] + cols) * cell_size,
             (pred_box_resp[..., 1] + rows) * cell_size,
@@ -261,7 +265,7 @@ class CustomCNNLoss(nn.Module):
         ], dim=-1)
         loss_coord = (obj * ciou(pred_abs, gt_abs)).sum()
 
-        # --- Confidence loss (MSE) ---
+        # Confidence loss
         loss_obj = (obj * (pred_conf_resp - best_iou_gt) ** 2).sum()
 
         resp_onehot = torch.zeros_like(pred_conf_all)
@@ -269,10 +273,8 @@ class CustomCNNLoss(nn.Module):
         noobj_mask = (~obj_mask).unsqueeze(-1) | (resp_onehot == 0)
         loss_noobj = (noobj_mask.float() * pred_conf_all ** 2).sum()
 
-        # --- Classification loss (BCE with logits — numerically stable) ---
-        loss_cls = (obj4 * F.binary_cross_entropy_with_logits(
-            pred_cls, gt_cls, reduction='none'
-        )).sum()
+        # Focal loss for classification (only at obj cells)
+        loss_cls = (obj4 * focal_loss(pred_cls, gt_cls)).sum()
 
         total = (
             self.lambda_coord * loss_coord
@@ -282,3 +284,9 @@ class CustomCNNLoss(nn.Module):
         ) / batch_size
 
         return total
+
+    def forward(self, predictions, targets: torch.Tensor) -> torch.Tensor:
+        if isinstance(predictions, list):
+            predictions = [p.float() for p in predictions]
+            return sum(self._forward_single(p, targets) for p in predictions) / len(predictions)
+        return self._forward_single(predictions.float(), targets)
