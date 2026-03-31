@@ -77,9 +77,8 @@ def focal_loss(
     gamma: float = 2.0,
     alpha: float = 0.25,
 ) -> torch.Tensor:
-    p = torch.sigmoid(logits)
-    bce = F.binary_cross_entropy(p, targets, reduction="none")
-    p_t = targets * p + (1 - targets) * (1 - p)
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t = targets * torch.sigmoid(logits) + (1 - targets) * torch.sigmoid(-logits)
     alpha_t = targets * alpha + (1 - targets) * (1 - alpha)
     return alpha_t * (1 - p_t) ** gamma * bce
 
