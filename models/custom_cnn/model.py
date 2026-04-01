@@ -30,16 +30,11 @@ class CustomCNN(nn.Module):
             out_channels=FPN_OUT,
         )
 
-        # Shared detection head
-        out_ch = B * 5 + C
-        self.head = nn.Sequential(
-            nn.Conv2d(FPN_OUT, 128, 1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(128, out_ch, 1),
-        )
+        # Scale-specific decoupled heads (YOLOX-style: separate cls and reg branches)
+        self.cls_heads = nn.ModuleList([self._make_cls_head() for _ in range(3)])
+        self.reg_heads = nn.ModuleList([self._make_reg_head() for _ in range(3)])
 
-        # Precompute sigmoid indices: cx, cy, conf for each box predictor
+        # Sigmoid indices: cx, cy, conf for each box predictor
         self._sig_idx = []
         for i in range(B):
             base = i * 5
@@ -47,21 +42,39 @@ class CustomCNN(nn.Module):
 
         self._init_head_weights()
 
-    def _init_head_weights(self):
-        for m in self.head.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, a=0.1, mode="fan_out",
-                                        nonlinearity="leaky_relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+    def _make_cls_head(self) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(FPN_OUT, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, self.C, 1),
+        )
 
-        # Proper bias init for classification outputs
+    def _make_reg_head(self) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(FPN_OUT, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, self.B * 5, 1),
+        )
+
+    def _init_head_weights(self):
+        for head_list in (self.cls_heads, self.reg_heads):
+            for head in head_list:
+                for m in head.modules():
+                    if isinstance(m, nn.Conv2d):
+                        nn.init.kaiming_normal_(m.weight, mode="fan_out",
+                                                nonlinearity="relu")
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
+                    elif isinstance(m, nn.BatchNorm2d):
+                        nn.init.ones_(m.weight)
+                        nn.init.zeros_(m.bias)
+        # Focal loss prior: start cls outputs at low confidence (pi=0.01)
         pi = 0.01
         with torch.no_grad():
-            self.head[-1].bias[self.B * 5:].fill_(-math.log((1 - pi) / pi))
+            for cls_head in self.cls_heads:
+                cls_head[-1].bias.fill_(-math.log((1 - pi) / pi))
 
     def freeze_backbone(self):
         for mod in [self.stem, self.layer1, self.layer2, self.layer3, self.layer4]:
@@ -72,8 +85,11 @@ class CustomCNN(nn.Module):
         for p in self.parameters():
             p.requires_grad = True
 
-    def _apply_head(self, feat: torch.Tensor) -> torch.Tensor:
-        out = self.head(feat).permute(0, 2, 3, 1).contiguous()  # (B, S, S, out_ch)
+    def _apply_head(self, feat: torch.Tensor, scale_idx: int) -> torch.Tensor:
+        reg = self.reg_heads[scale_idx](feat)  # (N, B*5, S, S)
+        cls = self.cls_heads[scale_idx](feat)  # (N, C, S, S)
+        # Concatenate reg then cls to preserve output format [B*5 | C]
+        out = torch.cat([reg, cls], dim=1).permute(0, 2, 3, 1).contiguous()  # (N, S, S, B*5+C)
         out[..., self._sig_idx] = torch.sigmoid(out[..., self._sig_idx])
         return out
 
@@ -87,7 +103,7 @@ class CustomCNN(nn.Module):
         fpn_out = self.fpn({"c3": c3, "c4": c4, "c5": c5})
 
         return [
-            self._apply_head(fpn_out["c3"]),  # P3
-            self._apply_head(fpn_out["c4"]),  # P4
-            self._apply_head(fpn_out["c5"]),  # P5
+            self._apply_head(fpn_out["c3"], 0),  # P3: 80×80 at 640px
+            self._apply_head(fpn_out["c4"], 1),  # P4: 40×40
+            self._apply_head(fpn_out["c5"], 2),  # P5: 20×20
         ]

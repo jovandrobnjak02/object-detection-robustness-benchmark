@@ -188,50 +188,89 @@ class CustomCNNLoss(nn.Module):
 
         # Fully vectorized across entire batch — no Python loop over batch items
         valid = targets[:, :, 0] >= 0  # (batch, max_boxes)
-        if valid.any():
-            b_idx, n_idx = valid.nonzero(as_tuple=True)  # (total_gts,)
-            gt_valid = targets[b_idx, n_idx]              # (total_gts, 5)
+        if not valid.any():
+            return gt_box, gt_cls, obj_mask, best_iou_gt, responsible_idx
 
-            cls_ids = gt_valid[:, 0].long()
-            cx, cy, w, h = gt_valid[:, 1], gt_valid[:, 2], gt_valid[:, 3], gt_valid[:, 4]
+        b_idx, n_idx = valid.nonzero(as_tuple=True)  # (total_gts,)
+        gt_valid = targets[b_idx, n_idx]              # (total_gts, 5)
 
-            col_f = cx / cell_size
-            row_f = cy / cell_size
-            cols  = col_f.long().clamp(0, S - 1)
-            rows  = row_f.long().clamp(0, S - 1)
-            cx_rel = col_f - cols.float()
-            cy_rel = row_f - rows.float()
+        cls_ids = gt_valid[:, 0].long()
+        cx, cy, w, h = gt_valid[:, 1], gt_valid[:, 2], gt_valid[:, 3], gt_valid[:, 4]
 
-            # Get predictions at all GT cell locations: (total_gts, B, 5)
-            pred_at = predictions[b_idx, rows, cols, :self.B * 5].reshape(-1, self.B, 5)
+        col_f  = cx / cell_size   # fractional col index
+        row_f  = cy / cell_size   # fractional row index
+        cols_c = col_f.long().clamp(0, S - 1)  # center cell col
+        rows_c = row_f.long().clamp(0, S - 1)  # center cell row
 
-            p_cx = (pred_at[:, :, 0] + cols.float().unsqueeze(1)) * cell_size
-            p_cy = (pred_at[:, :, 1] + rows.float().unsqueeze(1)) * cell_size
+        # Multi-positive assignment (OTA/YOLOX-style): assign center cell + up to 2
+        # neighbors — one in x direction, one in y direction — toward the nearest
+        # cell boundary. Gives up to 3 positives per GT (CVPR 2021, arXiv:2103.14259).
+        frac_x = col_f - cols_c.float()
+        frac_y = row_f - rows_c.float()
+        dx = torch.where(frac_x >= 0.5, torch.ones_like(cols_c), -torch.ones_like(cols_c))
+        dy = torch.where(frac_y >= 0.5, torch.ones_like(rows_c), -torch.ones_like(rows_c))
 
-            ious = iou(
-                torch.stack([p_cx, p_cy, pred_at[:, :, 2], pred_at[:, :, 3]], dim=-1),
-                torch.stack([cx, cy, w, h], dim=1).unsqueeze(1).expand(-1, self.B, -1),
-            )  # (total_gts, B)
+        # Candidate cells: (center), (x-neighbor), (y-neighbor) — shape (total_gts, 3)
+        cols_cands = torch.stack([cols_c, cols_c + dx, cols_c      ], dim=1)
+        rows_cands = torch.stack([rows_c, rows_c,      rows_c + dy ], dim=1)
 
-            best_js       = ious.argmax(dim=1)
-            best_iou_vals = ious.max(dim=1).values
+        in_bounds = (
+            (cols_cands >= 0) & (cols_cands < S) &
+            (rows_cands >= 0) & (rows_cands < S)
+        )  # (total_gts, 3)
 
-            # 3D flat index: batch_item * S*S + row * S + col
-            flat_3d = b_idx * (S * S) + rows * S + cols
+        # Expand GT attributes across 3 candidates, then flatten and filter
+        N_gt = b_idx.shape[0]
+        b_e      = b_idx.unsqueeze(1).expand(N_gt, 3)
+        cls_ids_e = cls_ids.unsqueeze(1).expand(N_gt, 3)
+        cx_e = cx.unsqueeze(1).expand(N_gt, 3)
+        cy_e = cy.unsqueeze(1).expand(N_gt, 3)
+        w_e  = w.unsqueeze(1).expand(N_gt, 3)
+        h_e  = h.unsqueeze(1).expand(N_gt, 3)
 
-            obj_mask.view(-1).scatter_(0, flat_3d,
-                torch.ones(len(flat_3d), dtype=torch.bool, device=device))
-            best_iou_gt.view(-1).scatter_(0, flat_3d, best_iou_vals)
-            responsible_idx.view(-1).scatter_(0, flat_3d, best_js)
+        keep = in_bounds.flatten()
+        b_f      = b_e.flatten()[keep]
+        col_idx  = cols_cands.flatten()[keep]
+        row_idx  = rows_cands.flatten()[keep]
+        cls_f    = cls_ids_e.flatten()[keep]
+        cx_f     = cx_e.flatten()[keep]
+        cy_f     = cy_e.flatten()[keep]
+        w_f      = w_e.flatten()[keep]
+        h_f      = h_e.flatten()[keep]
 
-            gt_box.view(-1, 4).scatter_(
-                0, flat_3d.unsqueeze(1).expand(-1, 4),
-                torch.stack([cx_rel, cy_rel, w, h], dim=1),
-            )
-            gt_cls.view(-1, self.C).scatter_(
-                0, flat_3d.unsqueeze(1).expand(-1, self.C),
-                F.one_hot(cls_ids, self.C).float(),
-            )
+        # Relative offsets within each candidate cell; clamp to [0,1] for neighbor
+        # cells whose center falls slightly outside (sigmoid target stays valid)
+        cx_rel = (cx_f / cell_size - col_idx.float()).clamp(0.0, 1.0)
+        cy_rel = (cy_f / cell_size - row_idx.float()).clamp(0.0, 1.0)
+
+        # Best box predictor at each candidate cell location
+        pred_at = predictions[b_f, row_idx, col_idx, :self.B * 5].reshape(-1, self.B, 5)
+        p_cx = (pred_at[:, :, 0] + col_idx.float().unsqueeze(1)) * cell_size
+        p_cy = (pred_at[:, :, 1] + row_idx.float().unsqueeze(1)) * cell_size
+
+        ious = iou(
+            torch.stack([p_cx, p_cy, pred_at[:, :, 2], pred_at[:, :, 3]], dim=-1),
+            torch.stack([cx_f, cy_f, w_f, h_f], dim=1).unsqueeze(1).expand(-1, self.B, -1),
+        )  # (total_candidates, B)
+
+        best_js       = ious.argmax(dim=1)
+        best_iou_vals = ious.max(dim=1).values
+
+        flat_3d = b_f * (S * S) + row_idx * S + col_idx
+
+        obj_mask.view(-1).scatter_(0, flat_3d,
+            torch.ones(len(flat_3d), dtype=torch.bool, device=device))
+        best_iou_gt.view(-1).scatter_(0, flat_3d, best_iou_vals)
+        responsible_idx.view(-1).scatter_(0, flat_3d, best_js)
+
+        gt_box.view(-1, 4).scatter_(
+            0, flat_3d.unsqueeze(1).expand(-1, 4),
+            torch.stack([cx_rel, cy_rel, w_f, h_f], dim=1),
+        )
+        gt_cls.view(-1, self.C).scatter_(
+            0, flat_3d.unsqueeze(1).expand(-1, self.C),
+            F.one_hot(cls_f, self.C).float(),
+        )
 
         return gt_box, gt_cls, obj_mask, best_iou_gt, responsible_idx
 

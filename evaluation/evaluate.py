@@ -16,11 +16,12 @@ from evaluation.metrics import (
     compute_confusion_matrix,
 )
 
-DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IMG_SIZE     = 448
-CONF_THRESH  = 0.25
-NMS_THRESH   = 0.45
-IOU_THRESH   = 0.5   # mAP@50
+DEVICE            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CNN_IMG_SIZE      = 640   # Custom CNN training resolution
+YOLO_IMG_SIZE     = 640   # YOLO26m training resolution
+CONF_THRESH       = 0.25
+NMS_THRESH        = 0.45
+IOU_THRESH        = 0.5   # mAP@50
 
 CUSTOM_CNN_CKPT = Path("checkpoints/custom_cnn/bdd100k_custom_cnn_best.pt")
 YOLO26_CKPT     = Path("checkpoints/yolo26/bdd100k/weights/best.pt")
@@ -116,7 +117,7 @@ def run_yolo26(model, dataset: BDD100KDataset) -> tuple[list[dict], float, float
         img = dataset._load_image(stem)
 
         t0 = time.perf_counter()
-        results = model.predict(img, imgsz=IMG_SIZE, conf=CONF_THRESH,
+        results = model.predict(img, imgsz=YOLO_IMG_SIZE, conf=CONF_THRESH,
                                 iou=NMS_THRESH, verbose=False)
         torch.cuda.synchronize()
         total_time += time.perf_counter() - t0
@@ -140,7 +141,7 @@ def run_yolo26(model, dataset: BDD100KDataset) -> tuple[list[dict], float, float
 
 def evaluate_split(split: str, custom_cnn_model, yolo26_model) -> dict:
     print(f"\n  Split: {split}")
-    dataset = BDD100KDataset(split=split, img_size=IMG_SIZE, augment=False)
+    dataset = BDD100KDataset(split=split, img_size=CNN_IMG_SIZE, augment=False)
     print(f"    {len(dataset)} images")
 
     all_gts = load_gt(dataset)

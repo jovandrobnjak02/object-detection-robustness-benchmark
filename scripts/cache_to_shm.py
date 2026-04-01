@@ -8,7 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-IMG_SIZE  = 448
+IMG_SIZE  = 640
 SHM_ROOT  = Path("/dev/shm/bdd100k_cache")
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 SPLITS    = ["clear_day/train", "clear_day/val"]

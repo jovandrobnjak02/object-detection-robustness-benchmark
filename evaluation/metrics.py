@@ -71,8 +71,8 @@ def compute_map(
 
         for i, (conf, img_id, pred_box) in enumerate(preds_cls):
             key = (img_id, cls)
-            gt_boxes = gt_by_img_cls.get(key, [])
-            if not gt_boxes:
+            gt_boxes = gt_by_img_cls.get(key, None)
+            if gt_boxes is None:
                 fp[i] = 1
                 continue
 

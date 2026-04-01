@@ -13,11 +13,11 @@ from datasets.bdd100k_dataset import BDD100KDataset, get_dataloader
 from models.custom_cnn import CustomCNN, CustomCNNLoss, decode_predictions, nms
 from evaluation.metrics import compute_map, box_cxcywh_to_xyxy
 
-EPOCHS         = 50
+EPOCHS         = 100
 WARMUP_EPOCHS  = 3
-BATCH_SIZE     = 128
+BATCH_SIZE     = 32
 NUM_WORKERS    = 4
-IMG_SIZE       = 448
+IMG_SIZE       = 640
 LR             = 1e-3
 NUM_CLASSES    = 10
 MAP_EVAL_EVERY = 5     # compute val mAP every N epochs
@@ -145,6 +145,7 @@ def train():
 
     start_epoch = 1
     best_val    = float("inf")
+    best_map    = -1.0
     resume_path = CHECKPOINTS / f"{tag}_latest.pt"
 
     # Freeze backbone during warmup (only train FPN + head)
@@ -161,6 +162,7 @@ def train():
             scaler.load_state_dict(ckpt["scaler_state"])
         start_epoch = ckpt["epoch"] + 1
         best_val    = ckpt["val_loss"]
+        best_map    = ckpt.get("best_map", -1.0)
         if start_epoch > WARMUP_EPOCHS:
             raw_model.unfreeze_backbone()
             print(f"Resumed from epoch {ckpt['epoch']} (backbone unfrozen), val_loss {ckpt['val_loss']:.4f}")
@@ -220,15 +222,19 @@ def train():
             "scheduler_state": scheduler.state_dict(),
             "scaler_state":    scaler.state_dict(),
             "val_loss":        val_loss,
+            "best_map":        best_map,
         }
         torch.save(ckpt, CHECKPOINTS / f"{tag}_latest.pt")
 
         if val_loss < best_val:
             best_val = val_loss
-            torch.save(ckpt, CHECKPOINTS / f"{tag}_best.pt")
-            print(f"  -> best val loss: {best_val:.4f}")
 
-    print(f"Training complete. Best val loss: {best_val:.4f}")
+        if map50 and float(map50) > best_map:
+            best_map = float(map50)
+            torch.save(ckpt, CHECKPOINTS / f"{tag}_best.pt")
+            print(f"  -> best mAP50: {best_map:.2f}%")
+
+    print(f"Training complete. Best mAP50: {best_map:.2f}%")
     print(f"Log saved to {log_path}")
 
 
