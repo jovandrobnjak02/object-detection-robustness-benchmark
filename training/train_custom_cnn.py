@@ -15,7 +15,7 @@ from evaluation.metrics import compute_map, box_cxcywh_to_xyxy
 
 EPOCHS         = 100
 WARMUP_EPOCHS  = 3
-BATCH_SIZE     = 32
+BATCH_SIZE     = 64
 NUM_WORKERS    = 4
 IMG_SIZE       = 640
 LR             = 1e-3
