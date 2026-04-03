@@ -21,7 +21,7 @@ IMG_SIZE       = 640
 LR             = 1e-3
 NUM_CLASSES    = 10
 MAP_EVAL_EVERY = 5     # compute val mAP every N epochs
-CONF_THRESH    = 0.25
+CONF_THRESH    = 0.001  # low threshold for mAP evaluation (captures all detections)
 NMS_THRESH     = 0.45
 
 CHECKPOINTS = Path(__file__).parent.parent / "checkpoints" / "custom_cnn"
@@ -31,6 +31,7 @@ LOGS        = Path(__file__).parent.parent / "results" / "logs"
 def run_epoch(model, loader, criterion, optimizer, scaler, device):
     model.train()
     total_loss = 0.0
+    n_finite = 0
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
@@ -43,13 +44,19 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device):
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        if torch.isfinite(total_norm):
+            scaler.step(optimizer)
+        else:
+            optimizer.zero_grad(set_to_none=True)
         scaler.update()
 
-        total_loss += loss.item()
+        if torch.isfinite(loss):
+            total_loss += loss.item()
+            n_finite += 1
 
-    return total_loss / len(loader)
+    return total_loss / max(n_finite, 1)
 
 
 @torch.no_grad()
@@ -113,10 +120,10 @@ def train():
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
 
     tag = "bdd100k_custom_cnn"
-    print(f"Run: {tag} (ResNet-50 + FPN, C={NUM_CLASSES})")
+    print(f"Run: {tag} (ResNet-50 + FPN, C={NUM_CLASSES})", flush=True)
 
     CHECKPOINTS.mkdir(parents=True, exist_ok=True)
     LOGS.mkdir(parents=True, exist_ok=True)
@@ -174,7 +181,7 @@ def train():
         print(f"Cannot resume (architecture changed): {e}")
         print("Starting fresh.")
 
-    if not log_path.exists() or log_path.stat().st_size == 0:
+    if start_epoch == 1 or not log_path.exists() or log_path.stat().st_size == 0:
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "map50", "lr", "epoch_time_s"])
 
@@ -206,7 +213,8 @@ def train():
         print(
             f"Epoch {epoch:3d}/{EPOCHS} | "
             f"train {train_loss:.4f} | val {val_loss:.4f}{map_str} | "
-            f"lr {current_lr:.2e} | {elapsed:.0f}s | GPU {gpu_mb:.0f}MB"
+            f"lr {current_lr:.2e} | {elapsed:.0f}s | GPU {gpu_mb:.0f}MB",
+            flush=True,
         )
 
         with open(log_path, "a", newline="") as f:

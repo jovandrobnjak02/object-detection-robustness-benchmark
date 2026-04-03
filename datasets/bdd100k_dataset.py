@@ -112,7 +112,7 @@ class BDD100KDataset(Dataset):
         return img
 
     def __getitem__(self, idx: int):
-        if self.augment and random.random() < 0.5:
+        if self.augment and random.random() < 0.25:
             img, labels = self._apply_mosaic(idx)
         else:
             stem = self.samples[idx]

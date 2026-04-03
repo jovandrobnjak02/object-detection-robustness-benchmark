@@ -32,24 +32,31 @@ def iou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
 
 
 def ciou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
-    eps = 1e-7
-    px1 = box_pred[..., 0] - box_pred[..., 2] / 2
-    py1 = box_pred[..., 1] - box_pred[..., 3] / 2
-    px2 = box_pred[..., 0] + box_pred[..., 2] / 2
-    py2 = box_pred[..., 1] + box_pred[..., 3] / 2
+    eps = 1e-6
 
-    gx1 = box_gt[..., 0] - box_gt[..., 2] / 2
-    gy1 = box_gt[..., 1] - box_gt[..., 3] / 2
-    gx2 = box_gt[..., 0] + box_gt[..., 2] / 2
-    gy2 = box_gt[..., 1] + box_gt[..., 3] / 2
+    # Clamp dimensions to prevent inf/NaN from degenerate boxes
+    pw = box_pred[..., 2].clamp(min=eps)
+    ph = box_pred[..., 3].clamp(min=eps)
+    gw = box_gt[..., 2].clamp(min=eps)
+    gh = box_gt[..., 3].clamp(min=eps)
+
+    px1 = box_pred[..., 0] - pw / 2
+    py1 = box_pred[..., 1] - ph / 2
+    px2 = box_pred[..., 0] + pw / 2
+    py2 = box_pred[..., 1] + ph / 2
+
+    gx1 = box_gt[..., 0] - gw / 2
+    gy1 = box_gt[..., 1] - gh / 2
+    gx2 = box_gt[..., 0] + gw / 2
+    gy2 = box_gt[..., 1] + gh / 2
 
     inter_x1 = torch.max(px1, gx1)
     inter_y1 = torch.max(py1, gy1)
     inter_x2 = torch.min(px2, gx2)
     inter_y2 = torch.min(py2, gy2)
     inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
-    area_p = (px2 - px1).clamp(0) * (py2 - py1).clamp(0)
-    area_g = (gx2 - gx1).clamp(0) * (gy2 - gy1).clamp(0)
+    area_p = (px2 - px1) * (py2 - py1)
+    area_g = (gx2 - gx1) * (gy2 - gy1)
     union = area_p + area_g - inter
     iou_val = inter / (union + eps)
 
@@ -62,13 +69,14 @@ def ciou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
     c2 = (enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2 + eps
 
     v = (4 / (math.pi ** 2)) * (
-        torch.atan(box_gt[..., 2] / (box_gt[..., 3] + eps))
-        - torch.atan(box_pred[..., 2] / (box_pred[..., 3] + eps))
+        torch.atan(gw / (gh + eps))
+        - torch.atan(pw / (ph + eps))
     ) ** 2
     with torch.no_grad():
         alpha = v / (1 - iou_val + v + eps)
 
-    return 1 - iou_val + rho2 / c2 + alpha * v
+    result = 1 - iou_val + rho2 / c2 + alpha * v
+    return torch.nan_to_num(result, nan=0.0, posinf=10.0, neginf=0.0)
 
 
 def focal_loss(
@@ -197,66 +205,29 @@ class CustomCNNLoss(nn.Module):
         cls_ids = gt_valid[:, 0].long()
         cx, cy, w, h = gt_valid[:, 1], gt_valid[:, 2], gt_valid[:, 3], gt_valid[:, 4]
 
-        col_f  = cx / cell_size   # fractional col index
-        row_f  = cy / cell_size   # fractional row index
-        cols_c = col_f.long().clamp(0, S - 1)  # center cell col
-        rows_c = row_f.long().clamp(0, S - 1)  # center cell row
+        col_f = cx / cell_size
+        row_f = cy / cell_size
+        cols  = col_f.long().clamp(0, S - 1)
+        rows  = row_f.long().clamp(0, S - 1)
+        cx_rel = col_f - cols.float()
+        cy_rel = row_f - rows.float()
 
-        # Multi-positive assignment (OTA/YOLOX-style): assign center cell + up to 2
-        # neighbors — one in x direction, one in y direction — toward the nearest
-        # cell boundary. Gives up to 3 positives per GT (CVPR 2021, arXiv:2103.14259).
-        frac_x = col_f - cols_c.float()
-        frac_y = row_f - rows_c.float()
-        dx = torch.where(frac_x >= 0.5, torch.ones_like(cols_c), -torch.ones_like(cols_c))
-        dy = torch.where(frac_y >= 0.5, torch.ones_like(rows_c), -torch.ones_like(rows_c))
+        # Get predictions at all GT cell locations: (total_gts, B, 5)
+        pred_at = predictions[b_idx, rows, cols, :self.B * 5].reshape(-1, self.B, 5)
 
-        # Candidate cells: (center), (x-neighbor), (y-neighbor) — shape (total_gts, 3)
-        cols_cands = torch.stack([cols_c, cols_c + dx, cols_c      ], dim=1)
-        rows_cands = torch.stack([rows_c, rows_c,      rows_c + dy ], dim=1)
-
-        in_bounds = (
-            (cols_cands >= 0) & (cols_cands < S) &
-            (rows_cands >= 0) & (rows_cands < S)
-        )  # (total_gts, 3)
-
-        # Expand GT attributes across 3 candidates, then flatten and filter
-        N_gt = b_idx.shape[0]
-        b_e      = b_idx.unsqueeze(1).expand(N_gt, 3)
-        cls_ids_e = cls_ids.unsqueeze(1).expand(N_gt, 3)
-        cx_e = cx.unsqueeze(1).expand(N_gt, 3)
-        cy_e = cy.unsqueeze(1).expand(N_gt, 3)
-        w_e  = w.unsqueeze(1).expand(N_gt, 3)
-        h_e  = h.unsqueeze(1).expand(N_gt, 3)
-
-        keep = in_bounds.flatten()
-        b_f      = b_e.flatten()[keep]
-        col_idx  = cols_cands.flatten()[keep]
-        row_idx  = rows_cands.flatten()[keep]
-        cls_f    = cls_ids_e.flatten()[keep]
-        cx_f     = cx_e.flatten()[keep]
-        cy_f     = cy_e.flatten()[keep]
-        w_f      = w_e.flatten()[keep]
-        h_f      = h_e.flatten()[keep]
-
-        # Relative offsets within each candidate cell; clamp to [0,1] for neighbor
-        # cells whose center falls slightly outside (sigmoid target stays valid)
-        cx_rel = (cx_f / cell_size - col_idx.float()).clamp(0.0, 1.0)
-        cy_rel = (cy_f / cell_size - row_idx.float()).clamp(0.0, 1.0)
-
-        # Best box predictor at each candidate cell location
-        pred_at = predictions[b_f, row_idx, col_idx, :self.B * 5].reshape(-1, self.B, 5)
-        p_cx = (pred_at[:, :, 0] + col_idx.float().unsqueeze(1)) * cell_size
-        p_cy = (pred_at[:, :, 1] + row_idx.float().unsqueeze(1)) * cell_size
+        p_cx = (pred_at[:, :, 0] + cols.float().unsqueeze(1)) * cell_size
+        p_cy = (pred_at[:, :, 1] + rows.float().unsqueeze(1)) * cell_size
 
         ious = iou(
             torch.stack([p_cx, p_cy, pred_at[:, :, 2], pred_at[:, :, 3]], dim=-1),
-            torch.stack([cx_f, cy_f, w_f, h_f], dim=1).unsqueeze(1).expand(-1, self.B, -1),
-        )  # (total_candidates, B)
+            torch.stack([cx, cy, w, h], dim=1).unsqueeze(1).expand(-1, self.B, -1),
+        )  # (total_gts, B)
 
         best_js       = ious.argmax(dim=1)
         best_iou_vals = ious.max(dim=1).values
 
-        flat_3d = b_f * (S * S) + row_idx * S + col_idx
+        # 3D flat index: batch_item * S*S + row * S + col
+        flat_3d = b_idx * (S * S) + rows * S + cols
 
         obj_mask.view(-1).scatter_(0, flat_3d,
             torch.ones(len(flat_3d), dtype=torch.bool, device=device))
@@ -265,11 +236,11 @@ class CustomCNNLoss(nn.Module):
 
         gt_box.view(-1, 4).scatter_(
             0, flat_3d.unsqueeze(1).expand(-1, 4),
-            torch.stack([cx_rel, cy_rel, w_f, h_f], dim=1),
+            torch.stack([cx_rel, cy_rel, w, h], dim=1),
         )
         gt_cls.view(-1, self.C).scatter_(
             0, flat_3d.unsqueeze(1).expand(-1, self.C),
-            F.one_hot(cls_f, self.C).float(),
+            F.one_hot(cls_ids, self.C).float(),
         )
 
         return gt_box, gt_cls, obj_mask, best_iou_gt, responsible_idx
@@ -303,8 +274,8 @@ class CustomCNNLoss(nn.Module):
         pred_abs = torch.stack([
             (pred_box_resp[..., 0] + cols) * cell_size,
             (pred_box_resp[..., 1] + rows) * cell_size,
-            pred_box_resp[..., 2].abs(),
-            pred_box_resp[..., 3].abs(),
+            pred_box_resp[..., 2].abs().clamp(min=1e-4, max=2.0),
+            pred_box_resp[..., 3].abs().clamp(min=1e-4, max=2.0),
         ], dim=-1)
         gt_abs = torch.stack([
             (gt_box[..., 0] + cols) * cell_size,
@@ -312,7 +283,11 @@ class CustomCNNLoss(nn.Module):
             gt_box[..., 2],
             gt_box[..., 3],
         ], dim=-1)
-        loss_coord = (obj * ciou(pred_abs, gt_abs)).sum()
+        # CIoU only at positive cells
+        if obj_mask.any():
+            loss_coord = ciou(pred_abs[obj_mask], gt_abs[obj_mask]).sum()
+        else:
+            loss_coord = pred_abs.sum() * 0.0
 
         # Confidence loss
         loss_obj = (obj * (pred_conf_resp - best_iou_gt) ** 2).sum()
@@ -322,7 +297,6 @@ class CustomCNNLoss(nn.Module):
         noobj_mask = (~obj_mask).unsqueeze(-1) | (resp_onehot == 0)
         loss_noobj = (noobj_mask.float() * pred_conf_all ** 2).sum()
 
-        # Focal loss for classification (only at obj cells)
         loss_cls = (obj4 * focal_loss(pred_cls, gt_cls)).sum()
 
         total = (
@@ -337,5 +311,12 @@ class CustomCNNLoss(nn.Module):
     def forward(self, predictions, targets: torch.Tensor) -> torch.Tensor:
         if isinstance(predictions, list):
             predictions = [p.float() for p in predictions]
-            return sum(self._forward_single(p, targets) for p in predictions) / len(predictions)
+            losses = []
+            for p in predictions:
+                l = self._forward_single(p, targets)
+                if torch.isfinite(l):
+                    losses.append(l)
+            if losses:
+                return sum(losses) / len(predictions)
+            return torch.tensor(0.0, device=predictions[0].device, requires_grad=True)
         return self._forward_single(predictions.float(), targets)
