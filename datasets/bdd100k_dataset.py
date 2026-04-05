@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms.functional as TF
 
 NUM_CLASSES = 10
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -47,15 +48,19 @@ class BDD100KDataset(Dataset):
         # Cache labels in memory, pre-remapped to letterboxed coords
         self._label_cache: dict[str, torch.Tensor] = {}
         for stem in self.samples:
-            boxes = []
-            for line in (self.labels_dir / f"{stem}.txt").read_text().splitlines():
-                parts = line.strip().split()
-                if len(parts) == 5:
-                    boxes.append([float(x) for x in parts])
+            label_file = self.labels_dir / f"{stem}.txt"
+            if label_file.exists():
+                lines = label_file.read_text().splitlines()
+                boxes = [
+                    [float(x) for x in line.strip().split()]
+                    for line in lines if len(line.strip().split()) == 5
+                ]
+            else:
+                boxes = []
             labels = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 5))
             self._label_cache[stem] = self._remap_labels(
                 labels, self._orig_w, self._orig_h,
-                self._scale, self._pad_left, self._pad_top, img_size
+                self._scale, self._pad_left, self._pad_top, self.img_size
             )
 
     def __len__(self) -> int:
@@ -112,18 +117,19 @@ class BDD100KDataset(Dataset):
         return img
 
     def __getitem__(self, idx: int):
-        if self.augment and random.random() < 0.25:
+        if self.augment and random.random() < 0.5:
             img, labels = self._apply_mosaic(idx)
         else:
             stem = self.samples[idx]
             img = self._load_image(stem)
-            labels = self._label_cache[stem].clone()  # ALWAYS clone
+            labels = self._label_cache[stem].clone()
 
         if self.augment:
             img, labels = self._apply_augmentations(img, labels)
 
-        img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-        return img, labels
+        img_tensor = torch.from_numpy(img).permute(2, 0, 1).contiguous().float() / 255.0
+        img_tensor = TF.normalize(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        return img_tensor, labels
 
     def _apply_mosaic(self, idx: int):
         half = self.img_size // 2
@@ -232,7 +238,7 @@ def get_dataloader(
         shuffle=should_shuffle,
         num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=False,
+        pin_memory=True,
         persistent_workers=num_workers > 0,
         prefetch_factor=2 if num_workers > 0 else None,
     )

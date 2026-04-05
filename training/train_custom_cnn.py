@@ -9,13 +9,14 @@ import numpy as np
 import torch
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
+import torchvision.transforms.functional as TF
 from datasets.bdd100k_dataset import BDD100KDataset, get_dataloader
 from models.custom_cnn import CustomCNN, CustomCNNLoss, decode_predictions, nms
 from evaluation.metrics import compute_map, box_cxcywh_to_xyxy
 
 EPOCHS         = 100
 WARMUP_EPOCHS  = 3
-BATCH_SIZE     = 64
+BATCH_SIZE     = 32
 NUM_WORKERS    = 4
 IMG_SIZE       = 640
 LR             = 1e-3
@@ -23,38 +24,56 @@ NUM_CLASSES    = 10
 MAP_EVAL_EVERY = 5     # compute val mAP every N epochs
 CONF_THRESH    = 0.001  # low threshold for mAP evaluation (captures all detections)
 NMS_THRESH     = 0.45
+ACCUM_STEPS    = 2
 
 CHECKPOINTS = Path(__file__).parent.parent / "checkpoints" / "custom_cnn"
 LOGS        = Path(__file__).parent.parent / "results" / "logs"
 
 
-def run_epoch(model, loader, criterion, optimizer, scaler, device):
+def run_epoch(model, loader, criterion, optimizer, scaler, device, accum_steps=ACCUM_STEPS):
     model.train()
     total_loss = 0.0
     n_finite = 0
 
-    for images, labels in loader:
+    optimizer.zero_grad(set_to_none=True)
+    for i, (images, labels) in enumerate(loader):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
         with autocast("cuda"):
             preds = model(images)
             loss  = criterion(preds, labels)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # scale loss down for gradient accumulation
+        loss_to_back = loss / float(accum_steps)
+        scaler.scale(loss_to_back).backward()
 
-        if torch.isfinite(total_norm):
+        # perform optimizer step every accum_steps
+        if (i + 1) % accum_steps == 0:
+            # unscale before clipping
+            try:
+                scaler.unscale_(optimizer)
+            except Exception:
+                pass
+            # gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
-        else:
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
-        scaler.update()
 
         if torch.isfinite(loss):
             total_loss += loss.item()
             n_finite += 1
+
+    # final step if there are leftover gradients
+    if len(loader) % accum_steps != 0:
+        scaler.unscale_(optimizer)
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if torch.isfinite(total_norm):
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.zero_grad(set_to_none=True)
 
     return total_loss / max(n_finite, 1)
 
@@ -85,7 +104,9 @@ def compute_val_map(model, val_dataset: BDD100KDataset, device: torch.device) ->
         imgs = []
         for stem in batch_stems:
             img = val_dataset._load_image(stem)
-            imgs.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
+            img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            img_tensor = TF.normalize(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            imgs.append(img_tensor)
         batch = torch.stack(imgs).to(device)
 
         preds = model(batch)
@@ -98,7 +119,8 @@ def compute_val_map(model, val_dataset: BDD100KDataset, device: torch.device) ->
             if dets.shape[0] > 0:
                 d = dets.cpu().numpy()
                 xyxy = box_cxcywh_to_xyxy(d[:, :4])
-                boxes = np.column_stack([xyxy, d[:, 4], d[:, 6]]).tolist()
+                scores = d[:, 4] * d[:, 5]
+                boxes = np.column_stack([xyxy, scores, d[:, 6]]).tolist()
             all_preds.append({"img_id": img_id, "boxes": boxes})
 
     # Build GT from label cache
@@ -140,7 +162,21 @@ def train():
 
     raw_model = CustomCNN(C=NUM_CLASSES).to(device)
     criterion = CustomCNNLoss(C=NUM_CLASSES)
-    optimizer = optim.AdamW(raw_model.parameters(), lr=LR, weight_decay=1e-4)
+    
+    # Separate param groups: backbone vs head for different learning rates
+    backbone_params = list(raw_model.stem.parameters()) + \
+                      list(raw_model.layer1.parameters()) + \
+                      list(raw_model.layer2.parameters()) + \
+                      list(raw_model.layer3.parameters()) + \
+                      list(raw_model.layer4.parameters())
+    head_params = list(raw_model.fpn.parameters()) + \
+                  list(raw_model.cls_head.parameters()) + \
+                  list(raw_model.reg_head.parameters())
+    
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': LR * 0.1},  # Backbone: 10x lower LR when unfrozen
+        {'params': head_params, 'lr': LR},             # Head: normal LR
+    ], weight_decay=1e-4)
     warmup_sched = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=WARMUP_EPOCHS)
     cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=EPOCHS - WARMUP_EPOCHS, eta_min=1e-6
@@ -171,8 +207,8 @@ def train():
         best_val    = ckpt["val_loss"]
         best_map    = ckpt.get("best_map", -1.0)
         if start_epoch > WARMUP_EPOCHS:
-            raw_model.unfreeze_backbone()
-            print(f"Resumed from epoch {ckpt['epoch']} (backbone unfrozen), val_loss {ckpt['val_loss']:.4f}")
+            raw_model.unfreeze_layer4_only()
+            print(f"Resumed from epoch {ckpt['epoch']} (layer4 unfrozen), val_loss {ckpt['val_loss']:.4f}")
         else:
             print(f"Resumed from epoch {ckpt['epoch']} (backbone frozen), val_loss {ckpt['val_loss']:.4f}")
     except FileNotFoundError:
@@ -185,18 +221,31 @@ def train():
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "map50", "lr", "epoch_time_s"])
 
+    # Use default compile mode (more stable with grad accumulation than reduce-overhead)
     model = torch.compile(raw_model)
 
     for epoch in range(start_epoch, EPOCHS + 1):
-        # Unfreeze backbone after warmup
+        # Unfreeze backbone progressively after warmup
         if epoch == WARMUP_EPOCHS + 1:
-            raw_model.unfreeze_backbone()
-            print("Backbone unfrozen.")
+            raw_model.unfreeze_layer4_only()
+            print("Layer4 unfrozen.") 
+        elif epoch == WARMUP_EPOCHS + 5:
+            raw_model.unfreeze_progressive()
+            print("Layer3 unfrozen.")
+        elif epoch == WARMUP_EPOCHS + 10:
+            raw_model.unfreeze_progressive()
+            print("Layer2 unfrozen.")
+        elif epoch == WARMUP_EPOCHS + 15:
+            raw_model.unfreeze_progressive()
+            print("Layer1 unfrozen.")
+        elif epoch == WARMUP_EPOCHS + 20:
+            raw_model.unfreeze_progressive()
+            print("Stem unfrozen (full backbone active).")
 
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
-        train_loss = run_epoch(model, train_loader, criterion, optimizer, scaler, device)
+        train_loss = run_epoch(model, train_loader, criterion, optimizer, scaler, device, accum_steps=ACCUM_STEPS)
         val_loss   = run_val(model, val_loader, criterion, device)
         scheduler.step()
         elapsed = time.time() - t0

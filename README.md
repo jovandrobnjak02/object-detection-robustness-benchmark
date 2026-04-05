@@ -1,13 +1,13 @@
 # Object Detection Robustness Benchmark
 
-Thesis project comparing a custom CNN (ResNet-50 + FPN) against YOLO26m on the BDD100K dataset. Models are trained on clear daytime conditions and evaluated on adverse weather and lighting conditions to measure robustness.
+Project comparing a custom CNN (ResNet-50 + FPN) against YOLO26m on the BDD100K dataset. Models are trained on clear daytime conditions and evaluated on adverse weather and lighting conditions to measure robustness.
 
 ## Models
 
 **Custom CNN**: ResNet-50 backbone (pretrained on ImageNet) + FPN neck + shared detection head.
 - Multi-scale detection across 3 FPN levels (P3, P4, P5)
 - 2 anchor boxes per cell, 10 classes
-- Backbone frozen during warmup, then fully fine-tuned
+- Backbone frozen during warmup (3 epochs), then progressively unfrozen layer-by-layer
 - AdamW optimizer, LR warmup + cosine annealing, mixed precision
 
 **YOLO26m** - Ultralytics YOLO26 medium, pretrained on COCO, fine-tuned on BDD100K.

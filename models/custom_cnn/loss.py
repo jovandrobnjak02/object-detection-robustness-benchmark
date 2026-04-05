@@ -34,7 +34,6 @@ def iou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
 def ciou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
     eps = 1e-6
 
-    # Clamp dimensions to prevent inf/NaN from degenerate boxes
     pw = box_pred[..., 2].clamp(min=eps)
     ph = box_pred[..., 3].clamp(min=eps)
     gw = box_gt[..., 2].clamp(min=eps)
@@ -79,6 +78,7 @@ def ciou(box_pred: torch.Tensor, box_gt: torch.Tensor) -> torch.Tensor:
     return torch.nan_to_num(result, nan=0.0, posinf=10.0, neginf=0.0)
 
 
+
 def focal_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -105,30 +105,43 @@ def _decode_single(
     rows = torch.arange(S, device=device).float().view(1, S, 1).expand(N, S, S)
     cols = torch.arange(S, device=device).float().view(1, 1, S).expand(N, S, S)
 
-    # Class scores — batched over N
-    best_cls_conf, best_cls = pred[:, :, :, B * 5:].sigmoid().max(dim=3)  # (N, S, S)
+    best_cls_conf, best_cls = pred[:, :, :, B * 5:].sigmoid().max(dim=3)
 
     all_dets = []
     for j in range(B):
         base = j * 5
-        cx   = (pred[:, :, :, base + 0] + cols) * cell_size  # (N, S, S)
-        cy   = (pred[:, :, :, base + 1] + rows) * cell_size
-        w    = pred[:, :, :, base + 2].abs()
-        h    = pred[:, :, :, base + 3].abs()
-        conf = pred[:, :, :, base + 4]
+        # apply sigmoid to center offsets (keep them within cell) and exp for sizes
+        cx   = (torch.sigmoid(pred[:, :, :, base + 0]) + cols) * cell_size
+        cy   = (torch.sigmoid(pred[:, :, :, base + 1]) + rows) * cell_size
+        # clip logits before exponentiating to avoid overflow / extreme sizes
+        w = torch.exp(torch.clamp(pred[:, :, :, base + 2], -10.0, 10.0)) * cell_size
+        h = torch.exp(torch.clamp(pred[:, :, :, base + 3], -10.0, 10.0)) * cell_size
+        conf = torch.sigmoid(pred[:, :, :, base + 4])
+
+        # clamp to valid normalized image coords / sizes to avoid numerical explosion
+        cx = cx.clamp(0.0, 1.0)
+        cy = cy.clamp(0.0, 1.0)
+        w = w.clamp(min=1e-6, max=1.0)
+        h = h.clamp(min=1e-6, max=1.0)
 
         dets = torch.stack([
             cx.flatten(1), cy.flatten(1), w.flatten(1), h.flatten(1),
             conf.flatten(1), best_cls_conf.flatten(1), best_cls.float().flatten(1),
-        ], dim=2)  # (N, S*S, 7)
+        ], dim=2)
         all_dets.append(dets)
 
     all_dets = torch.cat(all_dets, dim=1)  # (N, S*S*B, 7)
 
+    # Vectorized filtering: mask all batch at once
+    batch_idx = torch.arange(N, device=device).view(N, 1).expand(N, all_dets.shape[1])
+    conf_mask = all_dets[..., 4] >= conf_thresh
+    
     results = []
     for b in range(N):
-        mask = all_dets[b, :, 4] >= conf_thresh
-        results.append(all_dets[b][mask] if mask.any() else torch.zeros((0, 7), device=device))
+        if conf_mask[b].any():
+            results.append(all_dets[b, conf_mask[b]])
+        else:
+            results.append(torch.zeros((0, 7), device=device))
     return results
 
 
@@ -191,65 +204,97 @@ class CustomCNNLoss(nn.Module):
         gt_box          = torch.zeros(batch_size, S, S, 4, device=device)
         gt_cls          = torch.zeros(batch_size, S, S, self.C, device=device)
         obj_mask        = torch.zeros(batch_size, S, S, dtype=torch.bool, device=device)
+        coord_mask      = torch.zeros(batch_size, S, S, dtype=torch.bool, device=device)
         best_iou_gt     = torch.zeros(batch_size, S, S, device=device)
         responsible_idx = torch.zeros(batch_size, S, S, dtype=torch.long, device=device)
 
-        # Fully vectorized across entire batch — no Python loop over batch items
-        valid = targets[:, :, 0] >= 0  # (batch, max_boxes)
+        valid = targets[:, :, 0] >= 0
         if not valid.any():
-            return gt_box, gt_cls, obj_mask, best_iou_gt, responsible_idx
+            return gt_box, gt_cls, obj_mask, coord_mask, best_iou_gt, responsible_idx
 
-        b_idx, n_idx = valid.nonzero(as_tuple=True)  # (total_gts,)
-        gt_valid = targets[b_idx, n_idx]              # (total_gts, 5)
+        b_idx, n_idx = valid.nonzero(as_tuple=True)
+        gt_valid = targets[b_idx, n_idx]
 
         cls_ids = gt_valid[:, 0].long()
         cx, cy, w, h = gt_valid[:, 1], gt_valid[:, 2], gt_valid[:, 3], gt_valid[:, 4]
 
-        col_f = cx / cell_size
-        row_f = cy / cell_size
-        cols  = col_f.long().clamp(0, S - 1)
-        rows  = row_f.long().clamp(0, S - 1)
-        cx_rel = col_f - cols.float()
-        cy_rel = row_f - rows.float()
+        col_f  = cx / cell_size
+        row_f  = cy / cell_size
+        cols_c = col_f.long().clamp(0, S - 1)
+        rows_c = row_f.long().clamp(0, S - 1)
+        cx_rel = col_f - cols_c.float()
+        cy_rel = row_f - rows_c.float()
 
-        # Get predictions at all GT cell locations: (total_gts, B, 5)
-        pred_at = predictions[b_idx, rows, cols, :self.B * 5].reshape(-1, self.B, 5)
+        # --- Center cell assignments: coords + obj + cls ---
+        pred_at = predictions[b_idx, rows_c, cols_c, :self.B * 5].reshape(-1, self.B, 5)
+        p_cx = (torch.sigmoid(pred_at[:, :, 0]) + cols_c.float().unsqueeze(1)) * cell_size
+        p_cy = (torch.sigmoid(pred_at[:, :, 1]) + rows_c.float().unsqueeze(1)) * cell_size
+        # clip regression logits before exp to keep sizes reasonable
+        p_w = torch.exp(torch.clamp(pred_at[:, :, 2], -10.0, 10.0)) * cell_size
+        p_h = torch.exp(torch.clamp(pred_at[:, :, 3], -10.0, 10.0)) * cell_size
 
-        p_cx = (pred_at[:, :, 0] + cols.float().unsqueeze(1)) * cell_size
-        p_cy = (pred_at[:, :, 1] + rows.float().unsqueeze(1)) * cell_size
+        # clamp predicted sizes/centers to valid range
+        p_cx = p_cx.clamp(0.0, 1.0)
+        p_cy = p_cy.clamp(0.0, 1.0)
+        p_w = p_w.clamp(min=1e-6, max=1.0)
+        p_h = p_h.clamp(min=1e-6, max=1.0)
 
         ious = iou(
-            torch.stack([p_cx, p_cy, pred_at[:, :, 2], pred_at[:, :, 3]], dim=-1),
+            torch.stack([p_cx, p_cy, p_w, p_h], dim=-1),
             torch.stack([cx, cy, w, h], dim=1).unsqueeze(1).expand(-1, self.B, -1),
-        )  # (total_gts, B)
-
+        )
         best_js       = ious.argmax(dim=1)
-        best_iou_vals = ious.max(dim=1).values
+        best_iou_vals = ious.detach().max(dim=1).values
 
-        # 3D flat index: batch_item * S*S + row * S + col
-        flat_3d = b_idx * (S * S) + rows * S + cols
+        flat_center = b_idx * (S * S) + rows_c * S + cols_c
+        ones_c = torch.ones(len(flat_center), dtype=torch.bool, device=device)
 
-        obj_mask.view(-1).scatter_(0, flat_3d,
-            torch.ones(len(flat_3d), dtype=torch.bool, device=device))
-        best_iou_gt.view(-1).scatter_(0, flat_3d, best_iou_vals)
-        responsible_idx.view(-1).scatter_(0, flat_3d, best_js)
+        obj_mask.view(-1).scatter_(0, flat_center, ones_c)
+        coord_mask.view(-1).scatter_(0, flat_center, ones_c)
+        best_iou_gt.view(-1).scatter_(0, flat_center, best_iou_vals)
+        responsible_idx.view(-1).scatter_(0, flat_center, best_js)
 
         gt_box.view(-1, 4).scatter_(
-            0, flat_3d.unsqueeze(1).expand(-1, 4),
+            0, flat_center.unsqueeze(1).expand(-1, 4),
             torch.stack([cx_rel, cy_rel, w, h], dim=1),
         )
         gt_cls.view(-1, self.C).scatter_(
-            0, flat_3d.unsqueeze(1).expand(-1, self.C),
+            0, flat_center.unsqueeze(1).expand(-1, self.C),
             F.one_hot(cls_ids, self.C).float(),
         )
 
-        return gt_box, gt_cls, obj_mask, best_iou_gt, responsible_idx
+        # --- Neighbor assignments: obj + cls only (no coords) ---
+        frac_x = col_f - cols_c.float()
+        frac_y = row_f - rows_c.float()
+        dx = torch.where(frac_x >= 0.5, torch.ones_like(cols_c), -torch.ones_like(cols_c))
+        dy = torch.where(frac_y >= 0.5, torch.ones_like(rows_c), -torch.ones_like(rows_c))
+
+        for nb_col, nb_row in [(cols_c + dx, rows_c), (cols_c, rows_c + dy)]:
+            valid_nb = (nb_col >= 0) & (nb_col < S) & (nb_row >= 0) & (nb_row < S)
+            if not valid_nb.any():
+                continue
+            b_nb   = b_idx[valid_nb]
+            col_nb = nb_col[valid_nb]
+            row_nb = nb_row[valid_nb]
+            cls_nb = cls_ids[valid_nb]
+            js_nb  = best_js[valid_nb]
+
+            flat_nb = b_nb * (S * S) + row_nb * S + col_nb
+            obj_mask.view(-1).scatter_(0, flat_nb,
+                torch.ones(len(flat_nb), dtype=torch.bool, device=device))
+            responsible_idx.view(-1).scatter_(0, flat_nb, js_nb)
+            gt_cls.view(-1, self.C).scatter_(
+                0, flat_nb.unsqueeze(1).expand(-1, self.C),
+                F.one_hot(cls_nb, self.C).float(),
+            )
+
+        return gt_box, gt_cls, obj_mask, coord_mask, best_iou_gt, responsible_idx
 
     def _forward_single(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         S = predictions.shape[1]
         batch_size = predictions.shape[0]
 
-        gt_box, gt_cls, obj_mask, best_iou_gt, responsible_idx = self._build_targets(
+        gt_box, gt_cls, obj_mask, coord_mask, best_iou_gt, responsible_idx = self._build_targets(
             predictions, targets, S
         )
 
@@ -267,35 +312,43 @@ class CustomCNNLoss(nn.Module):
 
         # CIoU localization loss
         cell_size = 1.0 / S
-        dev = predictions.device
-        cols = torch.arange(S, device=dev).float().view(1, 1, S).expand(batch_size, S, S)
-        rows = torch.arange(S, device=dev).float().view(1, S, 1).expand(batch_size, S, S)
+        loss_coord = torch.tensor(0.0, device=predictions.device, dtype=predictions.dtype, requires_grad=True)
+        
+        if coord_mask.any():
+            dev = predictions.device
+            cols = torch.arange(S, device=dev).float().view(1, 1, S).expand(batch_size, S, S)
+            rows = torch.arange(S, device=dev).float().view(1, S, 1).expand(batch_size, S, S)
 
-        pred_abs = torch.stack([
-            (pred_box_resp[..., 0] + cols) * cell_size,
-            (pred_box_resp[..., 1] + rows) * cell_size,
-            pred_box_resp[..., 2].abs().clamp(min=1e-4, max=2.0),
-            pred_box_resp[..., 3].abs().clamp(min=1e-4, max=2.0),
-        ], dim=-1)
-        gt_abs = torch.stack([
-            (gt_box[..., 0] + cols) * cell_size,
-            (gt_box[..., 1] + rows) * cell_size,
-            gt_box[..., 2],
-            gt_box[..., 3],
-        ], dim=-1)
-        # CIoU only at positive cells
-        if obj_mask.any():
-            loss_coord = ciou(pred_abs[obj_mask], gt_abs[obj_mask]).sum()
-        else:
-            loss_coord = pred_abs.sum() * 0.0
+            p = pred_box_resp[coord_mask]   # (N_center, 4)
+            g = gt_box[coord_mask]          # (N_center, 4)
+            c = cols[coord_mask]            # (N_center,)
+            r = rows[coord_mask]            # (N_center,)
 
-        # Confidence loss
-        loss_obj = (obj * (pred_conf_resp - best_iou_gt) ** 2).sum()
+            pred_abs = torch.stack([
+                    ((torch.sigmoid(p[:, 0]) + c) * cell_size).clamp(0.0, 1.0),
+                    ((torch.sigmoid(p[:, 1]) + r) * cell_size).clamp(0.0, 1.0),
+                    (torch.exp(torch.clamp(p[:, 2], -10.0, 10.0)) * cell_size).clamp(min=1e-6, max=1.0),
+                    (torch.exp(torch.clamp(p[:, 3], -10.0, 10.0)) * cell_size).clamp(min=1e-6, max=1.0),
+                ], dim=-1)
+            gt_abs = torch.stack([
+                    (g[:, 0] + c) * cell_size,
+                    (g[:, 1] + r) * cell_size,
+                    g[:, 2],
+                    g[:, 3],
+                ], dim=-1)
+            loss_coord = ciou(pred_abs, gt_abs).sum()
+
+        # Confidence loss (use predicted probabilities)
+        pred_conf_resp_sig = torch.sigmoid(pred_conf_resp)
+        pred_conf_all_sig = torch.sigmoid(pred_conf_all)
+        loss_obj = F.binary_cross_entropy_with_logits(
+            pred_conf_resp, obj, reduction="none"
+        ).sum()
 
         resp_onehot = torch.zeros_like(pred_conf_all)
         resp_onehot.scatter_(3, responsible_idx.unsqueeze(-1), 1.0)
         noobj_mask = (~obj_mask).unsqueeze(-1) | (resp_onehot == 0)
-        loss_noobj = (noobj_mask.float() * pred_conf_all ** 2).sum()
+        loss_noobj = (noobj_mask.float() * pred_conf_all_sig ** 2).sum()
 
         loss_cls = (obj4 * focal_loss(pred_cls, gt_cls)).sum()
 
@@ -309,14 +362,25 @@ class CustomCNNLoss(nn.Module):
         return total
 
     def forward(self, predictions, targets: torch.Tensor) -> torch.Tensor:
-        if isinstance(predictions, list):
-            predictions = [p.float() for p in predictions]
-            losses = []
-            for p in predictions:
-                l = self._forward_single(p, targets)
-                if torch.isfinite(l):
-                    losses.append(l)
-            if losses:
-                return sum(losses) / len(predictions)
-            return torch.tensor(0.0, device=predictions[0].device, requires_grad=True)
-        return self._forward_single(predictions.float(), targets)
+        predictions = [p.float() for p in predictions]
+        losses = []
+        
+        for i, p in enumerate(predictions):
+            level_targets = targets.clone()
+            # Calculate areas in pixel-space for easier thresholding
+            # Assuming targets[..., 3:5] are normalized (0-1)
+            areas = (level_targets[..., 3] * 640) * (level_targets[..., 4] * 640)
+            
+            if i == 0:   # P3: Small (< 32x32 pixels)
+                mask = (areas < 1024)
+            elif i == 1: # P4: Medium (32x32 to 96x96)
+                mask = (areas >= 1024) & (areas < 9216)
+            else:        # P5: Large (> 96x96)
+                mask = (areas >= 9216)
+            
+            level_targets[~mask] = -1
+            l = self._forward_single(p, level_targets)
+            if torch.isfinite(l):
+                losses.append(l)
+                
+        return sum(losses) / len(losses) if losses else torch.tensor(0.0, device=targets.device)
