@@ -14,7 +14,7 @@ from datasets.bdd100k_dataset import BDD100KDataset, get_dataloader
 from models.custom_cnn import CustomCNN, CustomCNNLoss, decode_predictions, nms
 from evaluation.metrics import compute_map, box_cxcywh_to_xyxy
 
-EPOCHS         = 100
+EPOCHS         = 200
 WARMUP_EPOCHS  = 3
 BATCH_SIZE     = 32
 NUM_WORKERS    = 4
